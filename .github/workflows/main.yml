@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VoiceNotes Word Processor</title>
+    <!-- FontAwesome for Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- html2pdf for PDF export -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    <!-- html-docx-js for Word export -->
+    <script src="https://cdn.jsdelivr.net/npm/html-docx-js@0.3.1/dist/html-docx.js"></script>
+
+    <style>
+        :root {
+            --primary: #4f46e5;
+            --primary-hover: #4338ca;
+            --bg-color: #f3f4f6;
+            --editor-bg: #ffffff;
+            --text-color: #1f2937;
+            --border-color: #d1d5db;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        /* Top Navigation / Header */
+        header {
+            background-color: #ffffff;
+            border-bottom: 1px solid var(--border-color);
+            padding: 12px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--primary);
+        }
+
+        /* Toolbar */
+        .toolbar {
+            background-color: #ffffff;
+            border-bottom: 1px solid var(--border-color);
+            padding: 8px 24px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            align-items: center;
+        }
+
+        .tool-group {
+            display: flex;
+            align-items: center;
+            gap: 2px;
+            border-right: 1px solid var(--border-color);
+            padding-right: 8px;
+            margin-right: 4px;
+        }
+
+        .toolbar button, .toolbar select {
+            background: transparent;
+            border: 1px solid transparent;
+            border-radius: 4px;
+            padding: 6px 10px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            color: #4b5563;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .toolbar button:hover, .toolbar select:hover {
+            background-color: #f3f4f6;
+            color: var(--text-color);
+            border-color: var(--border-color);
+        }
+
+        .toolbar select {
+            border: 1px solid var(--border-color);
+            background-color: #fff;
+        }
+
+        /* Mic Button Special Styling */
+        #mic-btn {
+            background-color: #fee2e2;
+            color: #dc2626;
+            border: 1px solid #fecaca;
+            font-weight: 600;
+            gap: 6px;
+        }
+
+        #mic-btn.recording {
+            background-color: #dc2626;
+            color: #fff;
+            animation: pulse 1.5s infinite;
+        }
+
+        /* Noise Filter Toggle Button Styling */
+        #noise-filter-btn {
+            background-color: #f3f4f6;
+            color: #4b5563;
+            border: 1px solid var(--border-color);
+            font-weight: 500;
+            gap: 6px;
+        }
+
+        #noise-filter-btn.active {
+            background-color: #e0e7ff;
+            color: #4f46e5;
+            border-color: #c7d2fe;
+            font-weight: 600;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+
+        /* Workspace / Document Area */
+        .workspace {
+            flex: 1;
+            display: flex;
+            justify-content: center;
+            padding: 30px;
+            overflow-y: auto;
+        }
+
+        .document-container {
+            width: 800px;
+            min-height: 1056px;
+            background-color: var(--editor-bg);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            padding: 60px;
+            border-radius: 4px;
+            outline: none;
+            line-height: 1.6;
+            font-size: 1.1rem;
+        }
+
+        /* Status bar */
+        footer {
+            background-color: #ffffff;
+            border-top: 1px solid var(--border-color);
+            padding: 8px 24px;
+            font-size: 0.85rem;
+            color: #6b7280;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .btn-primary {
+            background-color: var(--primary);
+            color: white;
+            border: none;
+            padding: 6px 14px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: 500;
+        }
+
+        .btn-primary:hover {
+            background-color: var(--primary-hover);
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Header -->
+    <header>
+        <div class="logo">
+            <i class="fa-solid fa-microphone-lines"></i>
+            <span>VoiceNotes Doc</span>
+        </div>
+        <div style="display: flex; gap: 10px;">
+            <button class="btn-primary" onclick="exportPDF()"><i class="fa-solid fa-file-pdf"></i> Export PDF</button>
+            <button class="btn-primary" onclick="exportWord()"><i class="fa-solid fa-file-word"></i> Export Word</button>
+        </div>
+    </header>
+
+    <!-- Toolbar mimicking Word processor features -->
+    <div class="toolbar">
+        <!-- Voice Recording Button -->
+        <div class="tool-group">
+            <button id="mic-btn" onclick="toggleSpeechRecognition()">
+                <i class="fa-solid fa-microphone" id="mic-icon"></i> <span id="mic-text">Record Voice</span>
+            </button>
+            <button id="noise-filter-btn" class="active" onclick="toggleNoiseFilter()" title="Toggle Background Noise Suppression">
+                <i class="fa-solid fa-shield-halved"></i> <span id="noise-status-text">Noise Filter: ON</span>
+            </button>
+        </div>
+
+        <!-- Formatting Tools -->
+        <div class="tool-group">
+            <select onchange="formatDoc('fontName', this.value);">
+                <option value="Segoe UI">Segoe UI</option>
+                <option value="Arial">Arial</option>
+                <option value="Georgia">Georgia</option>
+                <option value="Courier New">Courier New</option>
+            </select>
+            <select onchange="formatDoc('fontSize', this.value);">
+                <option value="3">Normal</option>
+                <option value="1">Small</option>
+                <option value="5">Large</option>
+                <option value="7">Huge</option>
+            </select>
+        </div>
+
+        <div class="tool-group">
+            <button onclick="formatDoc('bold')" title="Bold"><i class="fa-solid fa-bold"></i></button>
+            <button onclick="formatDoc('italic')" title="Italic"><i class="fa-solid fa-italic"></i></button>
+            <button onclick="formatDoc('underline')" title="Underline"><i class="fa-solid fa-underline"></i></button>
+            <button onclick="formatDoc('strikeThrough')" title="Strikethrough"><i class="fa-solid fa-strikethrough"></i></button>
+        </div>
+
+        <div class="tool-group">
+            <button onclick="formatDoc('justifyLeft')" title="Align Left"><i class="fa-solid fa-align-left"></i></button>
+            <button onclick="formatDoc('justifyCenter')" title="Align Center"><i class="fa-solid fa-align-center"></i></button>
+            <button onclick="formatDoc('justifyRight')" title="Align Right"><i class="fa-solid fa-align-right"></i></button>
+            <button onclick="formatDoc('justifyFull')" title="Justify"><i class="fa-solid fa-align-justify"></i></button>
+        </div>
+
+        <div class="tool-group">
+            <button onclick="formatDoc('insertUnorderedList')" title="Bullet List"><i class="fa-solid fa-list-ul"></i></button>
+            <button onclick="formatDoc('insertOrderedList')" title="Numbered List"><i class="fa-solid fa-list-ol"></i></button>
+        </div>
+
+        <div class="tool-group">
+            <button onclick="formatDoc('removeFormat')" title="Clear Formatting"><i class="fa-solid fa-eraser"></i></button>
+        </div>
+    </div>
+
+    <!-- Main Workspace Document -->
+    <div class="workspace">
+        <div id="editor" class="document-container" contenteditable="true">
+            <p>Welcome to VoiceNotes Doc! Click the red "Record Voice" button above and start speaking. The background noise filter is enabled by default to keep your transcription clean and accurate. You can edit text, apply rich-text styles, and export when you're finished.</p>
+        </div>
+    </div>
+
+    <!-- Status Bar -->
+    <footer>
+        <span id="word-count">Words: 0 | Characters: 0</span>
+        <span id="status-msg">Ready</span>
+    </footer>
+
+    <script>
+        // --- Rich Text Formatting Handler ---
+        function formatDoc(cmd, value = null) {
+            document.execCommand(cmd, false, value);
+            document.getElementById('editor').focus();
+        }
+
+        // --- Word & Character Counter ---
+        const editor = document.getElementById('editor');
+        const wordCountDisplay = document.getElementById('word-count');
+
+        editor.addEventListener('input', updateCounts);
+
+        function updateCounts() {
+            const text = editor.innerText || "";
+            const charCount = text.length;
+            const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+            wordCountDisplay.innerText = `Words: ${words} | Characters: ${charCount}`;
+        }
+        updateCounts();
+
+        // --- Noise Filter State ---
+        let noiseFilterEnabled = true;
+        let mediaStream = null;
+
+        function toggleNoiseFilter() {
+            noiseFilterEnabled = !noiseFilterEnabled;
+            const btn = document.getElementById('noise-filter-btn');
+            const txt = document.getElementById('noise-status-text');
+
+            if (noiseFilterEnabled) {
+                btn.classList.add('active');
+                txt.innerText = "Noise Filter: ON";
+                document.getElementById('status-msg').innerText = "Background noise filter activated.";
+            } else {
+                btn.classList.remove('active');
+                txt.innerText = "Noise Filter: OFF";
+                document.getElementById('status-msg').innerText = "Background noise filter deactivated.";
+            }
+
+            // If actively recording, restart stream with new constraints
+            if (isRecording) {
+                recognition.stop();
+                startMicStream();
+            }
+        }
+
+        // --- Web Speech API & Audio Stream Integration ---
+        let recognition = null;
+        let isRecording = false;
+
+        if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            recognition = new SpeechRecognition();
+            recognition.continuous = true;
+            recognition.interimResults = true;
+            recognition.lang = 'en-US';
+
+            recognition.onresult = (event) => {
+                let finalTranscript = '';
+
+                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    if (event.results[i].isFinal) {
+                        finalTranscript += event.results[i][0].transcript + ' ';
+                    }
+                }
+
+                if (finalTranscript) {
+                    document.getElementById('editor').focus();
+                    document.execCommand('insertText', false, finalTranscript);
+                    updateCounts();
+                }
+            };
+
+            recognition.onerror = (event) => {
+                document.getElementById('status-msg').innerText = `Speech error: ${event.error}`;
+                stopRecordingState();
+            };
+
+            recognition.onend = () => {
+                if (isRecording) {
+                    try {
+                        recognition.start();
+                    } catch (e) {
+                        console.error(e);
+                    }
+                }
+            };
+        } else {
+            alert("Your browser doesn't support built-in speech recognition. Please use Google Chrome or Microsoft Edge.");
+        }
+
+        async function startMicStream() {
+            try {
+                // Request microphone access with dynamic noise suppression constraints
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: noiseFilterEnabled,
+                        noiseSuppression: noiseFilterEnabled,
+                        autoGainControl: noiseFilterEnabled
+                    }
+                });
+                
+                recognition.start();
+                startRecordingState();
+            } catch (err) {
+                console.error("Microphone access error:", err);
+                document.getElementById('status-msg').innerText = "Microphone permission denied or unavailable.";
+                stopRecordingState();
+            }
+        }
+
+        function toggleSpeechRecognition() {
+            if (!recognition) {
+                alert("Speech recognition is not available in this browser.");
+                return;
+            }
+
+            if (isRecording) {
+                if (mediaStream) {
+                    mediaStream.getTracks().forEach(track => track.stop());
+                }
+                recognition.stop();
+                stopRecordingState();
+            } else {
+                startMicStream();
+            }
+        }
+
+        function startRecordingState() {
+            isRecording = true;
+            const btn = document.getElementById('mic-btn');
+            const icon = document.getElementById('mic-icon');
+            const text = document.getElementById('mic-text');
+            
+            btn.classList.add('recording');
+            icon.className = "fa-solid fa-stop";
+            text.innerText = "Listening...";
+            document.getElementById('status-msg').innerText = noiseFilterEnabled ? "Recording with noise filter active..." : "Recording (raw audio)...";
+        }
+
+        function stopRecordingState() {
+            isRecording = false;
+            const btn = document.getElementById('mic-btn');
+            const icon = document.getElementById('mic-icon');
+            const text = document.getElementById('mic-text');
+            
+            btn.classList.remove('recording');
+            icon.className = "fa-solid fa-microphone";
+            text.innerText = "Record Voice";
+            document.getElementById('status-msg').innerText = "Paused / Ready";
+        }
+
+        // --- Export Functions ---
+        function exportPDF() {
+            const element = document.getElementById('editor');
+            const opt = {
+                margin:       1,
+                filename:     'voicenotes-document.pdf',
+                image:        { type: 'jpeg', quality: 0.98 },
+                html2canvas:  { scale: 2 },
+                jsPDF:        { unit: 'in', format: 'letter', orientation: 'portrait' }
+            };
+            document.getElementById('status-msg').innerText = "Generating PDF...";
+            html2pdf().from(element).set(opt).save().then(() => {
+                document.getElementById('status-msg').innerText = "PDF downloaded successfully!";
+            });
+        }
+
+        function exportWord() {
+            const content = document.getElementById('editor').innerHTML;
+            const converted = htmlDocx.asBlob(`<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>${content}</body></html>`);
+            
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(converted);
+            link.download = 'voicenotes-document.docx';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            document.getElementById('status-msg').innerText = "Word document downloaded successfully!";
+        }
+    </script>
+</body>
+</html>
