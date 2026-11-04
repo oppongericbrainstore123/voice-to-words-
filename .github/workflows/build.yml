@@ -27,6 +27,8 @@ jobs:
         run: flutter pub add sqflite path path_provider record audioplayers pdf share_plus google_mlkit_translation archive:^3.6.1 whisper_flutter_new shared_preferences file_picker:^8.3.7
       - name: Allow microphone and internet
         run: sed -i 's#<application#<uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.INTERNET"/>\n    <application#' app/android/app/src/main/AndroidManifest.xml
+      - name: Set app name
+        run: sed -i 's/android:label="voice_notes"/android:label="Voice Notes"/' app/android/app/src/main/AndroidManifest.xml
       - name: Raise minimum Android version
         run: |
           sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 26/' app/android/app/build.gradle.kts || true
@@ -63,6 +65,49 @@ jobs:
           else
             cat fix.groovy >> app/android/build.gradle
           fi
+      - name: Make app icon
+        run: |
+          mkdir -p app/assets/icon
+          if [ -f icon.png ]; then
+            cp icon.png app/assets/icon/icon.png
+          else
+            python3 -m pip install --break-system-packages pillow || python3 -m pip install pillow
+            cat > makeicon.py << 'EOF'
+          from PIL import Image, ImageDraw
+
+          S = 1024
+          BG = (63, 81, 181, 255)
+          WHITE = (255, 255, 255, 255)
+
+          def draw_mic(d, k):
+              def X(v): return 512 + (v - 512) * k
+              def Y(v): return 512 + (v - 512) * k
+              w = max(1, int(40 * k))
+              d.rounded_rectangle([X(412), Y(200), X(612), Y(580)], radius=100 * k, fill=WHITE)
+              d.arc([X(312), Y(280), X(712), Y(680)], 0, 180, fill=WHITE, width=w)
+              d.line([X(512), Y(680), X(512), Y(810)], fill=WHITE, width=w)
+              d.line([X(412), Y(810), X(612), Y(810)], fill=WHITE, width=w)
+
+          full = Image.new('RGBA', (S, S), BG)
+          draw_mic(ImageDraw.Draw(full), 1.0)
+          full.save('app/assets/icon/icon.png')
+
+          fg = Image.new('RGBA', (S, S), (0, 0, 0, 0))
+          draw_mic(ImageDraw.Draw(fg), 0.62)
+          fg.save('app/assets/icon/foreground.png')
+          EOF
+            python3 makeicon.py
+          fi
+      - name: Apply app icon
+        working-directory: app
+        run: |
+          flutter pub add --dev flutter_launcher_icons
+          if [ -f assets/icon/foreground.png ]; then
+            printf 'flutter_launcher_icons:\n  android: true\n  ios: false\n  image_path: "assets/icon/icon.png"\n  adaptive_icon_background: "#3F51B5"\n  adaptive_icon_foreground: "assets/icon/foreground.png"\n' > flutter_launcher_icons.yaml
+          else
+            printf 'flutter_launcher_icons:\n  android: true\n  ios: false\n  image_path: "assets/icon/icon.png"\n' > flutter_launcher_icons.yaml
+          fi
+          dart run flutter_launcher_icons
       - name: Build APK
         working-directory: app
         run: flutter build apk --release
