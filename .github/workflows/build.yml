@@ -1,10 +1,8 @@
-name: Build Android APK
-
+Name: Build Android APK
 on:
   workflow_dispatch:
   push:
     branches: [main]
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -31,12 +29,10 @@ jobs:
         run: sed -i 's#<application#<uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.INTERNET"/>\n    <application#' app/android/app/src/main/AndroidManifest.xml
       - name: Set app name
         run: sed -i 's/android:label="voice_notes"/android:label="Voice Notes"/' app/android/app/src/main/AndroidManifest.xml
-      - name: Raise minimum Android version and set NDK version
+      - name: Raise minimum Android version
         run: |
           sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 26/' app/android/app/build.gradle.kts || true
           sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 26/' app/android/app/build.gradle || true
-          sed -i '/defaultConfig {/a \    ndkVersion = "27.0.11902837"' app/android/app/build.gradle.kts || true
-          sed -i '/defaultConfig {/a \    ndkVersion "27.0.11902837"' app/android/app/build.gradle || true
       - name: Force newer compileSdk for all plugins
         run: |
           cat > fix.kts << 'EOF'
@@ -65,9 +61,9 @@ jobs:
           }
           EOF
           if [ -f app/android/build.gradle.kts ]; then
-            cat fix.kts >> app/android/app/build.gradle.kts
+            cat fix.kts >> app/android/build.gradle.kts
           else
-            cat fix.groovy >> app/android/app/build.gradle
+            cat fix.groovy >> app/android/build.gradle
           fi
       - name: Make app icon
         run: |
