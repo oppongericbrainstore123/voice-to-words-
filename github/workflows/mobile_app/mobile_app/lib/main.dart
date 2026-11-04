@@ -32,12 +32,13 @@ class AppErrors {
 
 // ============================================================
 // BACKGROUND RECORDING (Android foreground service)
+// Nothing here runs until the user taps Record.
 // ============================================================
 
 class RecordingService {
   static bool _ready = false;
 
-  static void init() {
+  static void _init() {
     if (_ready) return;
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(
@@ -58,8 +59,8 @@ class RecordingService {
   }
 
   static Future<void> start() async {
-    init();
     try {
+      _init();
       final perm = await FlutterForegroundTask.checkNotificationPermission();
       if (perm != NotificationPermission.granted) {
         await FlutterForegroundTask.requestNotificationPermission();
@@ -78,6 +79,7 @@ class RecordingService {
 
   static Future<void> update(String text) async {
     try {
+      if (!_ready) return;
       if (await FlutterForegroundTask.isRunningService) {
         await FlutterForegroundTask.updateService(notificationText: text);
       }
@@ -86,6 +88,7 @@ class RecordingService {
 
   static Future<void> stop() async {
     try {
+      if (!_ready) return;
       if (await FlutterForegroundTask.isRunningService) {
         await FlutterForegroundTask.stopService();
       }
@@ -103,8 +106,9 @@ void main() {
   runZonedGuarded(() async {
     WidgetsFlutterBinding.ensureInitialized();
     FlutterError.onError = (d) => AppErrors.report(d.exceptionAsString());
-    await AppSettings.load();
-    RecordingService.init();
+    try {
+      await AppSettings.load();
+    } catch (_) {}
     runApp(const VoiceNotesApp());
   }, (e, s) => AppErrors.report('$e'));
 }
@@ -276,7 +280,9 @@ class WhisperService {
 
   // "tiny" is light and fast on phones. Switch to WhisperModel.base
   // later for better accuracy on a faster phone.
-  final Whisper _whisper = Whisper(model: WhisperModel.tiny);
+  Whisper? _whisperInstance;
+  Whisper get _whisper =>
+      _whisperInstance ??= Whisper(model: WhisperModel.tiny);
 
   /// 'idle' | 'preparing' | 'ready' | 'error'
   final ValueNotifier<String> status = ValueNotifier('idle');
@@ -297,19 +303,21 @@ class WhisperService {
     return c.future;
   }
 
-  /// Downloads/loads the model in the background so the first real
-  /// recording is not slow.
+  /// Downloads/loads the model. Only runs when the user taps Download
+  /// (or on the first transcription).
   Future<void> warmUp() async {
     if (status.value == 'preparing' || status.value == 'ready') return;
     status.value = 'preparing';
     lastError = null;
     try {
-      await _serial(() => _run(Uint8List(32000), 'en'))
+      // 3 seconds of silence, enough to make the engine load its model.
+      await _serial(() => _run(Uint8List(96000), 'en'))
           .timeout(const Duration(minutes: 15));
       status.value = 'ready';
     } catch (e) {
       lastError = '$e';
       status.value = 'error';
+      AppErrors.report('Speech model problem: $e');
     }
   }
 
@@ -463,8 +471,9 @@ class VoiceIsolator {
 // ============================================================
 
 class TranslationService {
-  static final OnDeviceTranslatorModelManager _manager =
-      OnDeviceTranslatorModelManager();
+  static OnDeviceTranslatorModelManager? _managerInstance;
+  static OnDeviceTranslatorModelManager get _manager =>
+      _managerInstance ??= OnDeviceTranslatorModelManager();
 
   static List<TranslateLanguage> get languages => TranslateLanguage.values;
 
@@ -1213,7 +1222,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
   static const double _skipPeak = 250; // chunks quieter than this are skipped
   static const int _slots = 48;
 
-  final AudioRecorder _rec = AudioRecorder();
+  AudioRecorder? _recInstance;
+  AudioRecorder get _rec => _recInstance ??= AudioRecorder();
   final VoiceIsolator _iso = VoiceIsolator();
   StreamSubscription<Uint8List>? _sub;
   final BytesBuilder _all = BytesBuilder(copy: false);
@@ -1246,13 +1256,12 @@ class _RecorderScreenState extends State<RecorderScreen> {
   void initState() {
     super.initState();
     _loadPrefs();
-    WhisperService.instance.warmUp();
   }
 
   @override
   void dispose() {
     _sub?.cancel();
-    _rec.dispose();
+    _recInstance?.dispose();
     _tick.dispose();
     _scroll.dispose();
     WakelockPlus.disable();
@@ -1261,18 +1270,22 @@ class _RecorderScreenState extends State<RecorderScreen> {
   }
 
   Future<void> _loadPrefs() async {
-    final prefs = await SharedPreferences.getInstance();
-    if (!mounted) return;
-    setState(() {
-      _lang = prefs.getString('lang') ?? 'auto';
-      _isolate = prefs.getBool('isolate') ?? false;
-    });
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (!mounted) return;
+      setState(() {
+        _lang = prefs.getString('lang') ?? 'auto';
+        _isolate = prefs.getBool('isolate') ?? false;
+      });
+    } catch (_) {}
   }
 
   Future<void> _savePrefs() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('lang', _lang);
-    await prefs.setBool('isolate', _isolate);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('lang', _lang);
+      await prefs.setBool('isolate', _isolate);
+    } catch (_) {}
   }
 
   void _setError(String m) {
@@ -1382,7 +1395,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
         _saved = null;
       });
       AppErrors.last.value = null;
-      WakelockPlus.enable(); // keep the screen on while the app is open
+      try {
+        WakelockPlus.enable(); // keep the screen on while the app is open
+      } catch (_) {}
       await RecordingService.start(); // keeps recording in the background
       final stream = await _rec.startStream(RecordConfig(
         encoder: AudioEncoder.pcm16bits,
@@ -1577,6 +1592,17 @@ class _RecorderScreenState extends State<RecorderScreen> {
             ),
           ]);
         }
+        if (s == 'idle') {
+          return Row(children: [
+            const Icon(Icons.download_for_offline, size: 18),
+            const SizedBox(width: 8),
+            const Expanded(child: Text('Speech model not downloaded yet.')),
+            FilledButton.tonal(
+              onPressed: () => WhisperService.instance.warmUp(),
+              child: const Text('Download'),
+            ),
+          ]);
+        }
         return const Row(children: [
           SizedBox(
               width: 16,
@@ -1585,7 +1611,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
           SizedBox(width: 8),
           Expanded(
               child: Text(
-                  'Preparing speech model (first time needs internet)...')),
+                  'Downloading speech model. Keep the app open and internet on...')),
         ]);
       },
     );
