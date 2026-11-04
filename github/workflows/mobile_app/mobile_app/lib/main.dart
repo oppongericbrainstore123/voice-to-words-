@@ -551,7 +551,7 @@ class ExportService {
     }
 
     const xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
-    final files = <String, String>{
+    final Map<String, String> files = {
       '[Content_Types].xml':
           '$xml<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
               '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
@@ -590,7 +590,7 @@ class BackupService {
   static Future<void> backup() async {
     final notes = await NoteDb.instance.all();
     final archive = Archive();
-    final list = <Map<String, Object?>>[];
+    final list = [];
 
     for (final n in notes) {
       final m = n.toMap();
