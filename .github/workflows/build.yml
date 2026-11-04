@@ -27,6 +27,42 @@ jobs:
         run: flutter pub add sqflite path path_provider record audioplayers pdf share_plus google_mlkit_translation archive:^3.6.1 whisper_flutter_new shared_preferences file_picker:^8.3.7
       - name: Allow microphone and internet
         run: sed -i 's#<application#<uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.INTERNET"/>\n    <application#' app/android/app/src/main/AndroidManifest.xml
+      - name: Raise minimum Android version
+        run: |
+          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 26/' app/android/app/build.gradle.kts || true
+          sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 26/' app/android/app/build.gradle || true
+      - name: Force newer compileSdk for all plugins
+        run: |
+          cat > fix.kts << 'EOF'
+
+          subprojects {
+              if (name != "app") {
+                  val fix = Action<Project> {
+                      extensions.findByName("android")?.withGroovyBuilder {
+                          "compileSdkVersion"(36)
+                      }
+                  }
+                  if (state.executed) fix.execute(this) else afterEvaluate(fix)
+              }
+          }
+          EOF
+          cat > fix.groovy << 'EOF'
+
+          subprojects {
+              if (project.name != "app") {
+                  afterEvaluate { p ->
+                      if (p.hasProperty("android")) {
+                          p.android.compileSdkVersion 36
+                      }
+                  }
+              }
+          }
+          EOF
+          if [ -f app/android/build.gradle.kts ]; then
+            cat fix.kts >> app/android/build.gradle.kts
+          else
+            cat fix.groovy >> app/android/build.gradle
+          fi
       - name: Build APK
         working-directory: app
         run: flutter build apk --release
