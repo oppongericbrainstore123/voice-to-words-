@@ -16,6 +16,8 @@ jobs:
         with:
           channel: stable
           cache: true
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
       - name: Create a fresh Flutter project
         run: flutter create --org com.example --project-name voice_notes --platforms=android app
       - name: Copy in my code
