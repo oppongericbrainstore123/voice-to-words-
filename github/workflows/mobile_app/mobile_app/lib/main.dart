@@ -20,13 +20,21 @@ import 'package:sqflite/sqflite.dart';
 import 'package:whisper_flutter_new/whisper_flutter_new.dart';
 
 // ============================================================
-// APP START + THEME
+// APP START + THEME + ERROR CATCHING
 // ============================================================
 
-Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  await AppSettings.load();
-  runApp(const VoiceNotesApp());
+class AppErrors {
+  static final ValueNotifier<String?> last = ValueNotifier(null);
+  static void report(String message) => last.value = message;
+}
+
+void main() {
+  runZonedGuarded(() async {
+    WidgetsFlutterBinding.ensureInitialized();
+    FlutterError.onError = (d) => AppErrors.report(d.exceptionAsString());
+    await AppSettings.load();
+    runApp(const VoiceNotesApp());
+  }, (e, s) => AppErrors.report('$e'));
 }
 
 class AppSettings {
@@ -194,8 +202,9 @@ class WhisperService {
   WhisperService._();
   static final WhisperService instance = WhisperService._();
 
-  // Use WhisperModel.tiny for older/slower phones.
-  final Whisper _whisper = Whisper(model: WhisperModel.base);
+  // "tiny" is light and fast on phones. Switch to WhisperModel.base
+  // later for better accuracy on a faster phone.
+  final Whisper _whisper = Whisper(model: WhisperModel.tiny);
 
   static Uint8List pcmToWav(Uint8List pcm, {int sampleRate = 16000}) {
     final h = ByteData(44);
@@ -261,16 +270,17 @@ class WhisperService {
 }
 
 // ============================================================
-// VOICE ISOLATION (noise filter)
+// VOICE ISOLATION (optional noise filter)
 // ============================================================
 
 class VoiceIsolator {
   static const int _frame = 320;
+  final Float64List _buf = Float64List(_frame);
 
   double _px = 0, _py = 0;
   double _floor = -1;
   double _level = 1500;
-  double _gain = 0.12;
+  double _gain = 0.3;
   double _makeup = 1;
 
   void reset() {
@@ -278,7 +288,7 @@ class VoiceIsolator {
     _py = 0;
     _floor = -1;
     _level = 1500;
-    _gain = 0.12;
+    _gain = 0.3;
     _makeup = 1;
   }
 
@@ -289,7 +299,7 @@ class VoiceIsolator {
 
     for (var start = 0; start < n; start += _frame) {
       final len = min(_frame, n - start);
-      final f = List<double>.filled(len, 0);
+      final f = _buf;
       double sum = 0;
 
       for (var i = 0; i < len; i++) {
@@ -304,7 +314,7 @@ class VoiceIsolator {
       final rms = sqrt(sum / len);
       if (_floor < 0) _floor = max(rms, 50);
 
-      final speech = rms > _floor * 2.5 && rms > 150;
+      final speech = rms > _floor * 2.0 && rms > 120;
 
       if (rms < _floor) {
         _floor = 0.9 * _floor + 0.1 * rms;
@@ -313,13 +323,13 @@ class VoiceIsolator {
       }
       _floor = max(_floor, 30);
 
-      final targetGain = speech ? 1.0 : 0.12;
+      final targetGain = speech ? 1.0 : 0.3;
       final newGain =
           _gain + (targetGain - _gain) * (targetGain > _gain ? 0.6 : 0.15);
 
       if (speech) {
         _level = 0.95 * _level + 0.05 * rms;
-        final want = (3000 / _level).clamp(1.0, 4.0).toDouble();
+        final want = (3000 / _level).clamp(1.0, 3.0).toDouble();
         _makeup = 0.9 * _makeup + 0.1 * want;
       }
 
@@ -952,8 +962,8 @@ class RecorderScreen extends StatefulWidget {
 
 class _RecorderScreenState extends State<RecorderScreen> {
   static const int _rate = 16000;
-  static const double _minSecs = 5;
-  static const double _maxSecs = 15;
+  static const double _minSecs = 4;
+  static const double _maxSecs = 12;
   static const double _silence = 500;
 
   final AudioRecorder _rec = AudioRecorder();
@@ -966,16 +976,22 @@ class _RecorderScreenState extends State<RecorderScreen> {
 
   RecState _state = RecState.idle;
   bool _saving = false;
-  bool _isolate = true;
+  bool _isolate = false; // off by default: it can mute quiet voices
   String _lang = 'auto';
   String _text = '';
   int _pending = 0;
+  double _level = 0;
+  String? _error;
 
   @override
   void dispose() {
     _sub?.cancel();
     _rec.dispose();
     super.dispose();
+  }
+
+  void _setError(String m) {
+    if (mounted) setState(() => _error = m);
   }
 
   double _rms(Uint8List d) {
@@ -993,11 +1009,13 @@ class _RecorderScreenState extends State<RecorderScreen> {
   void _onAudio(Uint8List raw) {
     if (_state != RecState.recording) return;
     final data = _isolate ? _iso.process(raw) : raw;
+    final lvl = _rms(data);
     _all.add(data);
     _chunk.add(data);
     _chunkBytes += data.length;
+    if (mounted) setState(() => _level = lvl);
     final secs = _chunkBytes / (_rate * 2);
-    if (secs >= _minSecs && (secs >= _maxSecs || _rms(data) < _silence)) {
+    if (secs >= _minSecs && (secs >= _maxSecs || lvl < _silence)) {
       _flush();
     }
   }
@@ -1015,7 +1033,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
           setState(() => _text = _text.isEmpty ? t : '$_text $t');
         }
       } catch (e) {
-        debugPrint('Whisper error: $e');
+        _setError('Transcription error: $e');
       } finally {
         if (mounted) setState(() => _pending--);
       }
@@ -1023,31 +1041,40 @@ class _RecorderScreenState extends State<RecorderScreen> {
   }
 
   Future<void> _start() async {
-    if (!await _rec.hasPermission()) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Microphone permission is needed')),
+    try {
+      if (!await _rec.hasPermission()) {
+        _setError('Microphone permission was not granted. '
+            'Allow it in phone Settings > Apps > Voice Notes > Permissions.');
+        return;
+      }
+      _all.clear();
+      _chunk.clear();
+      _chunkBytes = 0;
+      _iso.reset();
+      setState(() {
+        _state = RecState.recording;
+        _text = '';
+        _pending = 0;
+        _level = 0;
+        _error = null;
+      });
+      AppErrors.last.value = null;
+      final stream = await _rec.startStream(RecordConfig(
+        encoder: AudioEncoder.pcm16bits,
+        sampleRate: _rate,
+        numChannels: 1,
+        noiseSuppress: _isolate,
+        echoCancel: _isolate,
+        autoGain: _isolate,
+      ));
+      _sub = stream.listen(
+        _onAudio,
+        onError: (e) => _setError('Microphone error: $e'),
       );
-      return;
+    } catch (e) {
+      _setError('Could not start recording: $e');
+      if (mounted) setState(() => _state = RecState.idle);
     }
-    _all.clear();
-    _chunk.clear();
-    _chunkBytes = 0;
-    _iso.reset();
-    setState(() {
-      _state = RecState.recording;
-      _text = '';
-      _pending = 0;
-    });
-    final stream = await _rec.startStream(RecordConfig(
-      encoder: AudioEncoder.pcm16bits,
-      sampleRate: _rate,
-      numChannels: 1,
-      noiseSuppress: _isolate,
-      echoCancel: _isolate,
-      autoGain: _isolate,
-    ));
-    _sub = stream.listen(_onAudio);
   }
 
   Future<void> _pause() async {
@@ -1072,46 +1099,87 @@ class _RecorderScreenState extends State<RecorderScreen> {
     setState(() {
       _state = RecState.idle;
       _saving = true;
+      _level = 0;
     });
-    await _sub?.cancel();
-    await _rec.stop();
-    _flush();
-    await _queue;
+    try {
+      await _sub?.cancel();
+      await _rec.stop();
+      _flush();
+      await _queue;
 
-    final text = _text.trim();
-    String? audio;
-    if (_all.length > 0) {
-      audio = await WhisperService.instance.saveWav(_all.toBytes());
+      final text = _text.trim();
+      String? audio;
+      if (_all.length > 0) {
+        audio = await WhisperService.instance.saveWav(_all.toBytes());
+      }
+      if (text.isNotEmpty || audio != null) {
+        final words = text.split(RegExp(r'\s+')).take(6).join(' ');
+        await NoteDb.instance.insert(Note(
+          title: words.isEmpty ? 'Voice note' : words,
+          transcript: text,
+          audioPath: audio,
+          createdAt: DateTime.now(),
+          locale: _lang == 'auto' ? null : _lang,
+        ));
+        if (mounted) {
+          ScaffoldMessenger.of(context)
+              .showSnackBar(const SnackBar(content: Text('Note saved')));
+        }
+      }
+    } catch (e) {
+      _setError('Could not save the note: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _saving = false;
+          _text = '';
+        });
+      }
     }
-    if (text.isNotEmpty || audio != null) {
-      final words = text.split(RegExp(r'\s+')).take(6).join(' ');
-      await NoteDb.instance.insert(Note(
-        title: words.isEmpty ? 'Voice note' : words,
-        transcript: text,
-        audioPath: audio,
-        createdAt: DateTime.now(),
-        locale: _lang == 'auto' ? null : _lang,
-      ));
-    }
-    if (!mounted) return;
-    setState(() {
-      _saving = false;
-      _text = '';
-    });
-    ScaffoldMessenger.of(context)
-        .showSnackBar(const SnackBar(content: Text('Note saved')));
   }
 
   String get _statusLabel {
     if (_saving) return 'Finishing transcription...';
     switch (_state) {
       case RecState.idle:
-        return 'Ready. First use downloads the Whisper model (internet once).';
+        return 'Ready. The first transcription downloads the speech model '
+            '(internet needed once).';
       case RecState.recording:
-        return _pending > 0 ? 'Recording... (transcribing)' : 'Recording...';
+        return _pending > 0
+            ? 'Recording... transcribing (first time is slow: downloads model)'
+            : 'Recording...';
       case RecState.paused:
         return 'Paused. Tap the mic to continue, or stop to save.';
     }
+  }
+
+  Widget _errorBox() {
+    return ValueListenableBuilder<String?>(
+      valueListenable: AppErrors.last,
+      builder: (context, globalError, _) {
+        final msg = _error ?? globalError;
+        if (msg == null) return const SizedBox.shrink();
+        return Card(
+          color: Theme.of(context).colorScheme.errorContainer,
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(child: SelectableText('Problem: $msg')),
+                IconButton(
+                  icon: const Icon(Icons.close),
+                  onPressed: () {
+                    AppErrors.last.value = null;
+                    setState(() => _error = null);
+                  },
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
   }
 
   Widget _settings() {
@@ -1133,10 +1201,25 @@ class _RecorderScreenState extends State<RecorderScreen> {
         SwitchListTile(
           contentPadding: EdgeInsets.zero,
           title: const Text('Voice isolation'),
-          subtitle: const Text('Filters background noise, levels your voice'),
+          subtitle: const Text('Filters background noise (may cut quiet voices)'),
           value: _isolate,
           onChanged: (v) => setState(() => _isolate = v),
         ),
+      ],
+    );
+  }
+
+  Widget _micMeter() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text('Mic level'),
+        const SizedBox(height: 4),
+        LinearProgressIndicator(
+          value: (_level / 4000).clamp(0.0, 1.0).toDouble(),
+          minHeight: 8,
+        ),
+        const SizedBox(height: 8),
       ],
     );
   }
@@ -1213,7 +1296,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
+            _errorBox(),
             if (_state == RecState.idle && !_saving) _settings(),
+            if (_state == RecState.recording) _micMeter(),
             Text(_statusLabel, style: Theme.of(context).textTheme.labelLarge),
             const SizedBox(height: 12),
             Expanded(
