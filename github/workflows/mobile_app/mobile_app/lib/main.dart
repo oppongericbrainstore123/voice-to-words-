@@ -9,6 +9,7 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:google_mlkit_translation/google_mlkit_translation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -17,6 +18,7 @@ import 'package:record/record.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite/sqflite.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:whisper_flutter_new/whisper_flutter_new.dart';
 
 // ============================================================
@@ -28,11 +30,81 @@ class AppErrors {
   static void report(String message) => last.value = message;
 }
 
+// ============================================================
+// BACKGROUND RECORDING (Android foreground service)
+// ============================================================
+
+class RecordingService {
+  static bool _ready = false;
+
+  static void init() {
+    if (_ready) return;
+    FlutterForegroundTask.init(
+      androidNotificationOptions: AndroidNotificationOptions(
+        channelId: 'voice_notes_recording',
+        channelName: 'Voice note recording',
+        channelDescription: 'Keeps recording while the app is in the background',
+        channelImportance: NotificationChannelImportance.LOW,
+        priority: NotificationPriority.LOW,
+      ),
+      iosNotificationOptions: const IOSNotificationOptions(),
+      foregroundTaskOptions: ForegroundTaskOptions(
+        eventAction: ForegroundTaskEventAction.nothing(),
+        allowWakeLock: true,
+        allowWifiLock: false,
+      ),
+    );
+    _ready = true;
+  }
+
+  static Future<void> start() async {
+    init();
+    try {
+      final perm = await FlutterForegroundTask.checkNotificationPermission();
+      if (perm != NotificationPermission.granted) {
+        await FlutterForegroundTask.requestNotificationPermission();
+      }
+      if (await FlutterForegroundTask.isRunningService) return;
+      await FlutterForegroundTask.startService(
+        serviceId: 256,
+        serviceTypes: [ForegroundServiceTypes.microphone],
+        notificationTitle: 'Voice Notes',
+        notificationText: 'Recording in progress...',
+      );
+    } catch (e) {
+      AppErrors.report('Background recording could not start: $e');
+    }
+  }
+
+  static Future<void> update(String text) async {
+    try {
+      if (await FlutterForegroundTask.isRunningService) {
+        await FlutterForegroundTask.updateService(notificationText: text);
+      }
+    } catch (_) {}
+  }
+
+  static Future<void> stop() async {
+    try {
+      if (await FlutterForegroundTask.isRunningService) {
+        await FlutterForegroundTask.stopService();
+      }
+    } catch (_) {}
+  }
+}
+
+String fmtDuration(Duration d) {
+  final m = d.inMinutes.toString().padLeft(2, '0');
+  final s = (d.inSeconds % 60).toString().padLeft(2, '0');
+  return '$m:$s';
+}
+
 void main() {
   runZonedGuarded(() async {
     WidgetsFlutterBinding.ensureInitialized();
     FlutterError.onError = (d) => AppErrors.report(d.exceptionAsString());
     await AppSettings.load();
+    RecordingService.init();
     runApp(const VoiceNotesApp());
   }, (e, s) => AppErrors.report('$e'));
 }
@@ -202,7 +274,44 @@ class WhisperService {
   WhisperService._();
   static final WhisperService instance = WhisperService._();
 
+  // "tiny" is light and fast on phones. Switch to WhisperModel.base
+  // later for better accuracy on a faster phone.
   final Whisper _whisper = Whisper(model: WhisperModel.tiny);
+
+  /// 'idle' | 'preparing' | 'ready' | 'error'
+  final ValueNotifier<String> status = ValueNotifier('idle');
+  String? lastError;
+
+  Future<void> _chain = Future.value();
+
+  /// Runs jobs one at a time so the engine is never used twice at once.
+  Future<T> _serial<T>(Future<T> Function() job) {
+    final c = Completer<T>();
+    _chain = _chain.then((_) async {
+      try {
+        c.complete(await job());
+      } catch (e, s) {
+        c.completeError(e, s);
+      }
+    });
+    return c.future;
+  }
+
+  /// Downloads/loads the model in the background so the first real
+  /// recording is not slow.
+  Future<void> warmUp() async {
+    if (status.value == 'preparing' || status.value == 'ready') return;
+    status.value = 'preparing';
+    lastError = null;
+    try {
+      await _serial(() => _run(Uint8List(32000), 'en'))
+          .timeout(const Duration(minutes: 15));
+      status.value = 'ready';
+    } catch (e) {
+      lastError = '$e';
+      status.value = 'error';
+    }
+  }
 
   static Uint8List pcmToWav(Uint8List pcm, {int sampleRate = 16000}) {
     final h = ByteData(44);
@@ -237,7 +346,7 @@ class WhisperService {
       .replaceAll(RegExp(r'\s+'), ' ')
       .trim();
 
-  Future<String> transcribePcm(Uint8List pcm, {String language = 'auto'}) async {
+  Future<String> _run(Uint8List pcm, String language) async {
     final dir = await getTemporaryDirectory();
     final f = File(
         '${dir.path}/chunk_${DateTime.now().microsecondsSinceEpoch}.wav');
@@ -258,6 +367,12 @@ class WhisperService {
     }
   }
 
+  Future<String> transcribePcm(Uint8List pcm, {String language = 'auto'}) async {
+    final text = await _serial(() => _run(pcm, language));
+    if (status.value != 'ready') status.value = 'ready';
+    return text;
+  }
+
   Future<String> saveWav(Uint8List pcm) async {
     final dir = await getApplicationDocumentsDirectory();
     final path =
@@ -268,7 +383,7 @@ class WhisperService {
 }
 
 // ============================================================
-// VOICE ISOLATION
+// VOICE ISOLATION (optional noise filter)
 // ============================================================
 
 class VoiceIsolator {
@@ -404,6 +519,8 @@ class ExportService {
     return f.writeAsString('$title\n\n$body');
   }
 
+  /// For non-Latin scripts, add assets/fonts/NotoSans-Regular.ttf
+  /// and list it in pubspec.yaml under flutter: assets:
   static Future<File> toPdf(String title, String body) async {
     pw.ThemeData? theme;
     try {
@@ -473,7 +590,7 @@ class BackupService {
   static Future<void> backup() async {
     final notes = await NoteDb.instance.all();
     final archive = Archive();
-    final list = >[];
+    final list = <Map<String, Object?>>[];
 
     for (final n in notes) {
       final m = n.toMap();
@@ -550,6 +667,96 @@ class BackupService {
 }
 
 // ============================================================
+// AUDIO PLAYER BAR (play / pause / seek)
+// ============================================================
+
+class PlayerBar extends StatefulWidget {
+  final String path;
+  const PlayerBar({super.key, required this.path});
+
+  @override
+  State<PlayerBar> createState() => _PlayerBarState();
+}
+
+class _PlayerBarState extends State<PlayerBar> {
+  final AudioPlayer _player = AudioPlayer();
+  final List<StreamSubscription> _subs = [];
+  PlayerState _state = PlayerState.stopped;
+  Duration _pos = Duration.zero;
+  Duration _dur = Duration.zero;
+
+  @override
+  void initState() {
+    super.initState();
+    _subs.addAll([
+      _player.onPlayerStateChanged.listen((s) {
+        if (mounted) setState(() => _state = s);
+      }),
+      _player.onPositionChanged.listen((d) {
+        if (mounted) setState(() => _pos = d);
+      }),
+      _player.onDurationChanged.listen((d) {
+        if (mounted) setState(() => _dur = d);
+      }),
+      _player.onPlayerComplete.listen((_) {
+        if (mounted) setState(() => _pos = Duration.zero);
+      }),
+    ]);
+    _player.setSourceDeviceFile(widget.path).catchError((_) {});
+  }
+
+  @override
+  void dispose() {
+    for (final s in _subs) {
+      s.cancel();
+    }
+    _player.dispose();
+    super.dispose();
+  }
+
+  Future<void> _toggle() async {
+    try {
+      if (_state == PlayerState.playing) {
+        await _player.pause();
+      } else if (_state == PlayerState.paused) {
+        await _player.resume();
+      } else {
+        await _player.play(DeviceFileSource(widget.path));
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Cannot play audio: $e')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final maxMs = max(_dur.inMilliseconds, 1);
+    final value = min(_pos.inMilliseconds, maxMs).toDouble();
+    return Row(
+      children: [
+        IconButton.filledTonal(
+          icon: Icon(_state == PlayerState.playing
+              ? Icons.pause
+              : Icons.play_arrow),
+          onPressed: _toggle,
+        ),
+        Expanded(
+          child: Slider(
+            value: value,
+            max: maxMs.toDouble(),
+            onChanged: (v) => _player.seek(Duration(milliseconds: v.toInt())),
+          ),
+        ),
+        Text('${fmtDuration(_pos)} / ${fmtDuration(_dur)}',
+            style: Theme.of(context).textTheme.labelSmall),
+      ],
+    );
+  }
+}
+
+// ============================================================
 // SETTINGS SCREEN
 // ============================================================
 
@@ -598,6 +805,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
           const SizedBox(height: 24),
+          Text('Recording', style: Theme.of(context).textTheme.titleMedium),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.battery_saver),
+            title: const Text('Allow background recording'),
+            subtitle: const Text(
+                'Stops the phone from closing the app when the screen is off'),
+            enabled: !_busy,
+            onTap: () => _run(() async {
+              final ok =
+                  await FlutterForegroundTask.isIgnoringBatteryOptimizations;
+              if (ok) return 'Already allowed';
+              await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+              return 'Choose Allow in the box that appeared';
+            }),
+          ),
+          const SizedBox(height: 24),
           Text('Backup', style: Theme.of(context).textTheme.titleMedium),
           ListTile(
             contentPadding: EdgeInsets.zero,
@@ -644,24 +868,13 @@ class NotesScreen extends StatefulWidget {
 }
 
 class _NotesScreenState extends State<NotesScreen> {
-  final AudioPlayer _player = AudioPlayer();
   List<Note> _notes = [];
   String _query = '';
-  int? _playingId;
 
   @override
   void initState() {
     super.initState();
     _load();
-    _player.onPlayerComplete.listen((_) {
-      if (mounted) setState(() => _playingId = null);
-    });
-  }
-
-  @override
-  void dispose() {
-    _player.dispose();
-    super.dispose();
   }
 
   Future<void> _load() async {
@@ -669,18 +882,23 @@ class _NotesScreenState extends State<NotesScreen> {
     if (mounted) setState(() => _notes = notes);
   }
 
-  Future<void> _togglePlay(Note n) async {
-    if (_playingId == n.id) {
-      await _player.stop();
-      setState(() => _playingId = null);
-    } else {
-      await _player.play(DeviceFileSource(n.audioPath!));
-      setState(() => _playingId = n.id);
-    }
-  }
-
   Future<void> _delete(Note n) async {
-    if (_playingId == n.id) await _player.stop();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete this note?'),
+        content: const Text('The text and its audio will be removed.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (ok != true) return;
     await NoteDb.instance.delete(n);
     _load();
   }
@@ -727,14 +945,8 @@ class _NotesScreenState extends State<NotesScreen> {
                     );
                     _load();
                   },
-                  leading: n.audioPath == null
-                      ? const Icon(Icons.notes)
-                      : IconButton(
-                          icon: Icon(_playingId == n.id
-                              ? Icons.stop_circle
-                              : Icons.play_circle),
-                          onPressed: () => _togglePlay(n),
-                        ),
+                  leading: Icon(
+                      n.audioPath == null ? Icons.notes : Icons.graphic_eq),
                   trailing: IconButton(
                     icon: const Icon(Icons.delete_outline),
                     onPressed: () => _delete(n),
@@ -747,7 +959,7 @@ class _NotesScreenState extends State<NotesScreen> {
 }
 
 // ============================================================
-// EDITOR SCREEN (edit, translate, export)
+// EDITOR SCREEN (play, edit, translate, export)
 // ============================================================
 
 class EditorScreen extends StatefulWidget {
@@ -862,6 +1074,8 @@ class _EditorScreenState extends State<EditorScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final audio = widget.note.audioPath;
+    final hasAudio = audio != null && File(audio).existsSync();
     return PopScope(
       canPop: true,
       onPopInvokedWithResult: (didPop, _) {
@@ -888,6 +1102,10 @@ class _EditorScreenState extends State<EditorScreen> {
         body: ListView(
           padding: const EdgeInsets.all(16),
           children: [
+            if (hasAudio) ...[
+              PlayerBar(key: ValueKey(audio), path: audio),
+              const SizedBox(height: 8),
+            ],
             TextField(
               controller: _title,
               decoration: const InputDecoration(labelText: 'Title'),
@@ -944,10 +1162,40 @@ class _EditorScreenState extends State<EditorScreen> {
 }
 
 // ============================================================
+// WAVEFORM
+// ============================================================
+
+class WavePainter extends CustomPainter {
+  final List<double> values;
+  final int slots;
+  final Color color;
+  WavePainter(this.values, this.slots, this.color);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..strokeCap = StrokeCap.round
+      ..strokeWidth = max(2.0, size.width / slots * 0.55);
+    final step = size.width / slots;
+    final mid = size.height / 2;
+    final n = values.length;
+    for (var i = 0; i < n; i++) {
+      final x = size.width - (n - i) * step + step / 2;
+      final h = max(4.0, values[i] * size.height);
+      canvas.drawLine(Offset(x, mid - h / 2), Offset(x, mid + h / 2), paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant WavePainter old) => true;
+}
+
+// ============================================================
 // RECORDER SCREEN (home)
 // ============================================================
 
-enum RecState { idle, recording, paused, preview }
+enum RecState { idle, recording, paused }
 
 class RecorderScreen extends StatefulWidget {
   const RecorderScreen({super.key});
@@ -958,70 +1206,77 @@ class RecorderScreen extends StatefulWidget {
 
 class _RecorderScreenState extends State<RecorderScreen> {
   static const int _rate = 16000;
-  static const double _minSecs = 2.0;
-  static const double _maxSecs = 5.0;
-  static const double _silence = 400;
+  static const double _minSecs = 3; // earliest a chunk may be cut
+  static const double _maxSecs = 10; // forced cut
+  static const double _silenceRms = 500; // below this = pause in speech
+  static const double _quietNeeded = 0.35; // seconds of quiet to cut
+  static const double _skipPeak = 250; // chunks quieter than this are skipped
+  static const int _slots = 48;
 
   final AudioRecorder _rec = AudioRecorder();
-  final AudioPlayer _previewPlayer = AudioPlayer();
   final VoiceIsolator _iso = VoiceIsolator();
   StreamSubscription<Uint8List>? _sub;
-  StreamSubscription<void>? _playerSub;
-  
   final BytesBuilder _all = BytesBuilder(copy: false);
   final BytesBuilder _chunk = BytesBuilder(copy: false);
   int _chunkBytes = 0;
+  int _quietBytes = 0;
+  double _chunkPeak = 0;
   Future<void> _queue = Future.value();
+  int _session = 0;
 
-  Timer? _timer;
-  int _elapsedSeconds = 0;
+  final ValueNotifier<int> _tick = ValueNotifier(0);
+  final List<double> _waves = [];
+  double _db = -90;
+  final ScrollController _scroll = ScrollController();
 
   RecState _state = RecState.idle;
   bool _saving = false;
-  bool _isPlayingPreview = false;
   bool _isolate = false;
   String _lang = 'auto';
   String _text = '';
   int _pending = 0;
-  double _level = 0;
   String? _error;
-  String? _tempAudioPath;
+  String? _previewPath;
+  Note? _saved;
+
+  Duration get _elapsed =>
+      Duration(milliseconds: _all.length * 1000 ~/ (_rate * 2));
 
   @override
   void initState() {
     super.initState();
-    _playerSub = _previewPlayer.onPlayerComplete.listen((_) {
-      if (mounted) setState(() => _isPlayingPreview = false);
-    });
+    _loadPrefs();
+    WhisperService.instance.warmUp();
   }
 
   @override
   void dispose() {
-    _timer?.cancel();
     _sub?.cancel();
-    _playerSub?.cancel();
     _rec.dispose();
-    _previewPlayer.dispose();
+    _tick.dispose();
+    _scroll.dispose();
+    WakelockPlus.disable();
+    RecordingService.stop();
     super.dispose();
+  }
+
+  Future<void> _loadPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      _lang = prefs.getString('lang') ?? 'auto';
+      _isolate = prefs.getBool('isolate') ?? false;
+    });
+  }
+
+  Future<void> _savePrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('lang', _lang);
+    await prefs.setBool('isolate', _isolate);
   }
 
   void _setError(String m) {
     if (mounted) setState(() => _error = m);
-  }
-
-  void _startTimer() {
-    _timer?.cancel();
-    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted && _state == RecState.recording) {
-        setState(() => _elapsedSeconds++);
-      }
-    });
-  }
-
-  String _formatTime(int seconds) {
-    final mins = (seconds ~/ 60).toString().padLeft(2, '0');
-    final secs = (seconds % 60).toString().padLeft(2, '0');
-    return '$mins:$secs';
   }
 
   double _rms(Uint8List d) {
@@ -1040,38 +1295,73 @@ class _RecorderScreenState extends State<RecorderScreen> {
     if (_state != RecState.recording) return;
     final data = _isolate ? _iso.process(raw) : raw;
     final lvl = _rms(data);
+
     _all.add(data);
     _chunk.add(data);
     _chunkBytes += data.length;
-    if (mounted) setState(() => _level = lvl);
-    
+    _chunkPeak = max(_chunkPeak, lvl);
+    if (lvl < _silenceRms) {
+      _quietBytes += data.length;
+    } else {
+      _quietBytes = 0;
+    }
+
+    _waves.add(sqrt((lvl / 8000).clamp(0.0, 1.0)));
+    if (_waves.length > _slots) _waves.removeAt(0);
+    _db = lvl < 1 ? -90 : 20 * log(lvl / 32768) / ln10;
+    _tick.value++;
+
     final secs = _chunkBytes / (_rate * 2);
-    if (secs >= _minSecs && (secs >= _maxSecs || lvl < _silence)) {
+    final quietSecs = _quietBytes / (_rate * 2);
+    if (secs >= _minSecs && (secs >= _maxSecs || quietSecs >= _quietNeeded)) {
       _flush();
     }
   }
 
   void _flush() {
-    if (_chunkBytes < _rate * 2 * 0.2) return;
+    if (_chunkBytes < _rate * 2 * 0.3) return;
     final bytes = _chunk.takeBytes();
+    final peak = _chunkPeak;
     _chunkBytes = 0;
+    _quietBytes = 0;
+    _chunkPeak = 0;
+    if (peak < _skipPeak) return; // silence: nothing to transcribe
+
+    final session = _session;
     if (mounted) setState(() => _pending++);
-    
     _queue = _queue.then((_) async {
       try {
         final t = await WhisperService.instance
             .transcribePcm(bytes, language: _lang);
-        if (t.isNotEmpty && mounted) {
-          setState(() {
-            _text = _text.isEmpty ? t : '$_text $t';
+        if (session == _session && t.isNotEmpty && mounted) {
+          setState(() => _text = _text.isEmpty ? t : '$_text $t');
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (_scroll.hasClients) {
+              _scroll.animateTo(
+                _scroll.position.maxScrollExtent,
+                duration: const Duration(milliseconds: 200),
+                curve: Curves.easeOut,
+              );
+            }
           });
         }
       } catch (e) {
         _setError('Transcription error: $e');
       } finally {
-        if (mounted) setState(() => _pending--);
+        if (mounted && session == _session) setState(() => _pending--);
       }
     });
+  }
+
+  void _resetBuffers() {
+    _all.clear();
+    _chunk.clear();
+    _chunkBytes = 0;
+    _quietBytes = 0;
+    _chunkPeak = 0;
+    _waves.clear();
+    _db = -90;
+    _iso.reset();
   }
 
   Future<void> _start() async {
@@ -1081,24 +1371,19 @@ class _RecorderScreenState extends State<RecorderScreen> {
             'Allow it in phone Settings > Apps > Voice Notes > Permissions.');
         return;
       }
-      await _previewPlayer.stop();
-      _all.clear();
-      _chunk.clear();
-      _chunkBytes = 0;
-      _elapsedSeconds = 0;
-      _iso.reset();
+      _session++;
+      _resetBuffers();
       setState(() {
         _state = RecState.recording;
         _text = '';
         _pending = 0;
-        _level = 0;
         _error = null;
-        _tempAudioPath = null;
-        _isPlayingPreview = false;
+        _previewPath = null;
+        _saved = null;
       });
       AppErrors.last.value = null;
-      _startTimer();
-      
+      WakelockPlus.enable(); // keep the screen on while the app is open
+      await RecordingService.start(); // keeps recording in the background
       final stream = await _rec.startStream(RecordConfig(
         encoder: AudioEncoder.pcm16bits,
         sampleRate: _rate,
@@ -1113,102 +1398,132 @@ class _RecorderScreenState extends State<RecorderScreen> {
       );
     } catch (e) {
       _setError('Could not start recording: $e');
+      WakelockPlus.disable();
+      RecordingService.stop();
       if (mounted) setState(() => _state = RecState.idle);
     }
   }
 
   Future<void> _pause() async {
     if (_state != RecState.recording) return;
-    _timer?.cancel();
-    setState(() => _state = RecState.paused);
+    setState(() {
+      _state = RecState.paused;
+      _previewPath = null;
+    });
     try {
       await _rec.pause();
     } catch (_) {}
+    RecordingService.update('Paused');
     _flush();
   }
 
   Future<void> _resume() async {
     if (_state != RecState.paused) return;
-    _startTimer();
     try {
       await _rec.resume();
     } catch (_) {}
-    setState(() => _state = RecState.recording);
+    RecordingService.update('Recording in progress...');
+    setState(() {
+      _state = RecState.recording;
+      _previewPath = null;
+    });
   }
 
-  Future<void> _stopToPreview() async {
-    if (_state == RecState.idle || _state == RecState.preview) return;
-    _timer?.cancel();
+  /// Lets the user hear everything recorded so far (while paused).
+  Future<void> _listenSoFar() async {
+    if (_all.length == 0) return;
+    try {
+      final dir = await getTemporaryDirectory();
+      final path =
+          '${dir.path}/preview_${DateTime.now().millisecondsSinceEpoch}.wav';
+      await File(path).writeAsBytes(WhisperService.pcmToWav(_all.toBytes()));
+      if (mounted) setState(() => _previewPath = path);
+    } catch (e) {
+      _setError('Could not prepare playback: $e');
+    }
+  }
+
+  Future<void> _discard() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Discard this recording?'),
+        content: const Text('Nothing will be saved.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Keep recording')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Discard')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    _session++; // ignore any text still being transcribed
+    await _sub?.cancel();
+    try {
+      await _rec.stop();
+    } catch (_) {}
+    WakelockPlus.disable();
+    RecordingService.stop();
+    _resetBuffers();
+    if (mounted) {
+      setState(() {
+        _state = RecState.idle;
+        _text = '';
+        _pending = 0;
+        _previewPath = null;
+      });
+    }
+  }
+
+  Future<void> _finish() async {
+    if (_state == RecState.idle) return;
     setState(() {
+      _state = RecState.idle;
       _saving = true;
-      _level = 0;
+      _previewPath = null;
     });
     try {
       await _sub?.cancel();
       await _rec.stop();
+      WakelockPlus.disable();
       _flush();
       await _queue;
+      RecordingService.stop(); // transcription is done: remove notification
 
-      if (_all.length > 0) {
-        _tempAudioPath = await WhisperService.instance.saveWav(_all.toBytes());
-      }
-      setState(() {
-        _state = RecState.preview;
-        _saving = false;
-      });
-    } catch (e) {
-      _setError('Could not process recording: $e');
-      setState(() {
-        _state = RecState.idle;
-        _saving = false;
-      });
-    }
-  }
-
-  Future<void> _togglePlaybackPreview() async {
-    if (_tempAudioPath == null) return;
-    if (_isPlayingPreview) {
-      await _previewPlayer.stop();
-      setState(() => _isPlayingPreview = false);
-    } else {
-      await _previewPlayer.play(DeviceFileSource(_tempAudioPath!));
-      setState(() => _isPlayingPreview = true);
-    }
-  }
-
-  Future<void> _saveNote() async {
-    setState(() => _saving = true);
-    try {
-      await _previewPlayer.stop();
       final text = _text.trim();
-      if (text.isNotEmpty || _tempAudioPath != null) {
+      String? audio;
+      if (_all.length > _rate * 2 ~/ 2) {
+        audio = await WhisperService.instance.saveWav(_all.toBytes());
+      }
+      if (text.isNotEmpty || audio != null) {
         final words = text.split(RegExp(r'\s+')).take(6).join(' ');
-        await NoteDb.instance.insert(Note(
+        final note = Note(
           title: words.isEmpty ? 'Voice note' : words,
           transcript: text,
-          audioPath: _tempAudioPath,
+          audioPath: audio,
           createdAt: DateTime.now(),
           locale: _lang == 'auto' ? null : _lang,
-        ));
-        if (mounted) {
-          ScaffoldMessenger.of(context)
-              .showSnackBar(const SnackBar(content: Text('Note saved successfully')));
-        }
+        );
+        note.id = await NoteDb.instance.insert(note);
+        if (mounted) setState(() => _saved = note);
       }
     } catch (e) {
-      _setError('Could not save note: $e');
+      RecordingService.stop();
+      _setError('Could not save the note: $e');
     } finally {
       if (mounted) {
         setState(() {
           _saving = false;
-          _state = RecState.idle;
           _text = '';
-          _tempAudioPath = null;
-          _elapsedSeconds = 0;
         });
       }
     }
   }
+
+  // ---------------- UI pieces ----------------
 
   Widget _errorBox() {
     return ValueListenableBuilder<String?>(
@@ -1239,145 +1554,324 @@ class _RecorderScreenState extends State<RecorderScreen> {
     );
   }
 
-  Widget _settings() {
-    return Column(
-      children: [
-        DropdownButtonFormField<String>(
-          value: _lang,
-          isExpanded: true,
-          decoration: const InputDecoration(labelText: 'Speaking language'),
-          items: [
-            const DropdownMenuItem(value: 'auto', child: Text('Auto-detect')),
-            ...TranslationService.languages.map((l) => DropdownMenuItem(
-                  value: l.bcpCode,
-                  child: Text(TranslationService.label(l)),
-                )),
+  Widget _modelStatus() {
+    return ValueListenableBuilder<String>(
+      valueListenable: WhisperService.instance.status,
+      builder: (context, s, _) {
+        if (s == 'ready') {
+          return const Row(children: [
+            Icon(Icons.check_circle, size: 18, color: Colors.green),
+            SizedBox(width: 8),
+            Expanded(child: Text('Speech model ready. Works offline.')),
+          ]);
+        }
+        if (s == 'error') {
+          return Row(children: [
+            const Icon(Icons.error_outline, size: 18, color: Colors.red),
+            const SizedBox(width: 8),
+            const Expanded(
+                child: Text('Speech model could not load. Check internet.')),
+            TextButton(
+              onPressed: () => WhisperService.instance.warmUp(),
+              child: const Text('Retry'),
+            ),
+          ]);
+        }
+        return const Row(children: [
+          SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(strokeWidth: 2)),
+          SizedBox(width: 8),
+          Expanded(
+              child: Text(
+                  'Preparing speech model (first time needs internet)...')),
+        ]);
+      },
+    );
+  }
+
+  Widget _idleTop() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          children: [
+            _modelStatus(),
+            const SizedBox(height: 8),
+            DropdownButtonFormField<String>(
+              value: _lang,
+              isExpanded: true,
+              decoration: const InputDecoration(
+                labelText: 'Speaking language',
+                helperText: 'Choosing your language is more accurate than Auto',
+              ),
+              items: [
+                const DropdownMenuItem(
+                    value: 'auto', child: Text('Auto-detect')),
+                ...TranslationService.languages.map((l) => DropdownMenuItem(
+                      value: l.bcpCode,
+                      child: Text(TranslationService.label(l)),
+                    )),
+              ],
+              onChanged: (v) {
+                setState(() => _lang = v ?? 'auto');
+                _savePrefs();
+              },
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Voice isolation'),
+              subtitle:
+                  const Text('Filters background noise (may cut quiet voices)'),
+              value: _isolate,
+              onChanged: (v) {
+                setState(() => _isolate = v);
+                _savePrefs();
+              },
+            ),
           ],
-          onChanged: (v) => setState(() => _lang = v ?? 'auto'),
         ),
-        SwitchListTile(
-          contentPadding: EdgeInsets.zero,
-          title: const Text('Voice isolation'),
-          subtitle: const Text('Filters background noise (may cut quiet voices)'),
-          value: _isolate,
-          onChanged: (v) => setState(() => _isolate = v),
+      ),
+    );
+  }
+
+  Widget _meterCard() {
+    final scheme = Theme.of(context).colorScheme;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: ValueListenableBuilder<int>(
+          valueListenable: _tick,
+          builder: (context, _, __) {
+            final paused = _state == RecState.paused;
+            String quality;
+            Color qColor;
+            if (paused) {
+              quality = 'Paused';
+              qColor = scheme.outline;
+            } else if (_db < -45) {
+              quality = 'Too quiet';
+              qColor = Colors.orange;
+            } else if (_db > -8) {
+              quality = 'Too loud';
+              qColor = Colors.red;
+            } else {
+              quality = 'Good level';
+              qColor = Colors.green;
+            }
+            return Column(
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(children: [
+                      Icon(Icons.fiber_manual_record,
+                          size: 14,
+                          color: paused ? scheme.outline : Colors.red),
+                      const SizedBox(width: 8),
+                      Text(
+                        fmtDuration(_elapsed),
+                        style: Theme.of(context).textTheme.headlineMedium,
+                      ),
+                    ]),
+                    Text(quality,
+                        style: TextStyle(
+                            color: qColor, fontWeight: FontWeight.w600)),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  height: 72,
+                  width: double.infinity,
+                  child: CustomPaint(
+                    painter: WavePainter(
+                        List<double>.of(_waves), _slots, scheme.primary),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text('${_db.round()} dB',
+                        style: Theme.of(context).textTheme.labelMedium),
+                    Text(
+                        '${(_all.length / 1024 / 1024).toStringAsFixed(1)} MB',
+                        style: Theme.of(context).textTheme.labelMedium),
+                  ],
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _transcriptArea() {
+    if (_saving) {
+      return const Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(height: 12),
+            Text('Finishing transcription and saving...'),
+          ],
+        ),
+      );
+    }
+
+    if (_state == RecState.idle && _saved != null) {
+      final n = _saved!;
+      return ListView(
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(children: [
+                    const Icon(Icons.check_circle, color: Colors.green),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text('Saved: ${n.title}',
+                          style: const TextStyle(fontWeight: FontWeight.bold)),
+                    ),
+                  ]),
+                  const SizedBox(height: 12),
+                  if (n.audioPath != null)
+                    PlayerBar(key: ValueKey(n.audioPath), path: n.audioPath!),
+                  const SizedBox(height: 8),
+                  SelectableText(n.transcript.isEmpty
+                      ? '(No speech was detected)'
+                      : n.transcript),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      FilledButton.icon(
+                        icon: const Icon(Icons.edit),
+                        label: const Text('Edit, translate, export'),
+                        onPressed: () async {
+                          await Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                                builder: (_) => EditorScreen(note: n)),
+                          );
+                          if (mounted) setState(() {});
+                        },
+                      ),
+                      OutlinedButton(
+                        onPressed: () => setState(() => _saved = null),
+                        child: const Text('Done'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
+    if (_state == RecState.idle) {
+      return const Center(child: Text('Tap the mic to start recording'));
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(children: [
+          Text('Live transcript',
+              style: Theme.of(context).textTheme.titleSmall),
+          const SizedBox(width: 8),
+          if (_pending > 0)
+            const SizedBox(
+                width: 12,
+                height: 12,
+                child: CircularProgressIndicator(strokeWidth: 2)),
+          if (_pending > 0)
+            Padding(
+              padding: const EdgeInsets.only(left: 6),
+              child: Text('transcribing...',
+                  style: Theme.of(context).textTheme.labelSmall),
+            ),
+        ]),
+        const SizedBox(height: 8),
+        if (_state == RecState.paused && _previewPath != null)
+          PlayerBar(key: ValueKey(_previewPath), path: _previewPath!),
+        Expanded(
+          child: SingleChildScrollView(
+            controller: _scroll,
+            child: SizedBox(
+              width: double.infinity,
+              child: Text(
+                _text.isEmpty
+                    ? 'Start speaking. Text appears after each phrase...'
+                    : _text,
+                style: Theme.of(context).textTheme.bodyLarge,
+              ),
+            ),
+          ),
         ),
       ],
     );
   }
 
-  Widget _recordingReadingsDisplay() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(0.5),
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Column(
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Row(
-                children: [
-                  Container(
-                    width: 12,
-                    height: 12,
-                    decoration: BoxDecoration(
-                      color: _state == RecState.recording ? Colors.red : Colors.orange,
-                      shape: BoxShape.circle,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    _state == RecState.recording ? 'SIMULTANEOUS TRANSCRIPTION' : 'PAUSED',
-                    style: const TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.1),
-                  ),
-                ],
-              ),
-              Text(
-                _formatTime(_elapsedSeconds),
-                style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, fontFamily: 'monospace'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          const Align(
-            alignment: Alignment.centerLeft,
-            child: Text('Live Mic Level Readings', style: TextStyle(fontSize: 12, color: Colors.grey)),
-          ),
-          const SizedBox(height: 4),
-          LinearProgressIndicator(
-            value: (_level / 4000).clamp(0.0, 1.0).toDouble(),
-            minHeight: 10,
-            borderRadius: BorderRadius.circular(5),
-          ),
-        ],
-      ),
+  Widget _btn(IconData icon, String label, VoidCallback? onTap,
+      {required String tag, bool big = false, bool small = false}) {
+    final Widget b = big
+        ? FloatingActionButton.large(
+            heroTag: tag, onPressed: onTap, child: Icon(icon))
+        : small
+            ? FloatingActionButton.small(
+                heroTag: tag, onPressed: onTap, child: Icon(icon))
+            : FloatingActionButton(
+                heroTag: tag, onPressed: onTap, child: Icon(icon));
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [b, const SizedBox(height: 6), Text(label)],
     );
   }
 
   Widget _controls() {
-    if (_saving) return const CircularProgressIndicator();
+    if (_saving) return const SizedBox(height: 96);
     switch (_state) {
       case RecState.idle:
-        return FloatingActionButton.large(
-          heroTag: 'start',
-          onPressed: _start,
-          child: const Icon(Icons.mic, size: 36),
-        );
+        return _btn(Icons.mic, 'Record', _start, tag: 'main', big: true);
       case RecState.recording:
         return Row(
-          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+          crossAxisAlignment: CrossAxisAlignment.end,
           children: [
-            FloatingActionButton(
-              heroTag: 'pause',
-              onPressed: _pause,
-              child: const Icon(Icons.pause),
-            ),
-            const SizedBox(width: 24),
-            FloatingActionButton.large(
-              heroTag: 'stop_rec',
-              onPressed: _stopToPreview,
-              backgroundColor: Theme.of(context).colorScheme.error,
-              foregroundColor: Theme.of(context).colorScheme.onError,
-              child: const Icon(Icons.stop, size: 36),
-            ),
+            _btn(Icons.delete_outline, 'Discard', _discard,
+                tag: 'discard', small: true),
+            _btn(Icons.pause, 'Pause', _pause, tag: 'main', big: true),
+            _btn(Icons.stop, 'Save', _finish, tag: 'save'),
           ],
         );
       case RecState.paused:
-        return Row(
-          mainAxisAlignment: MainAxisAlignment.center,
+        return Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            FloatingActionButton(
-              heroTag: 'resume',
-              onPressed: _resume,
-              child: const Icon(Icons.mic),
+            FilledButton.tonalIcon(
+              onPressed: _listenSoFar,
+              icon: const Icon(Icons.headphones),
+              label: const Text('Listen so far'),
             ),
-            const SizedBox(width: 24),
-            FloatingActionButton.large(
-              heroTag: 'stop_paused',
-              onPressed: _stopToPreview,
-              backgroundColor: Theme.of(context).colorScheme.error,
-              foregroundColor: Theme.of(context).colorScheme.onError,
-              child: const Icon(Icons.stop, size: 36),
-            ),
-          ],
-        );
-      case RecState.preview:
-        return Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            ElevatedButton.icon(
-              onPressed: _togglePlaybackPreview,
-              icon: Icon(_isPlayingPreview ? Icons.pause_circle : Icons.play_circle),
-              label: Text(_isPlayingPreview ? 'Pause Audio' : 'Play Recording'),
-            ),
-            const SizedBox(width: 16),
-            FilledButton.icon(
-              onPressed: _saveNote,
-              icon: const Icon(Icons.save),
-              label: const Text('Save Note'),
+            const SizedBox(height: 12),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                _btn(Icons.delete_outline, 'Discard', _discard,
+                    tag: 'discard', small: true),
+                _btn(Icons.mic, 'Resume', _resume, tag: 'main', big: true),
+                _btn(Icons.stop, 'Save', _finish, tag: 'save'),
+              ],
             ),
           ],
         );
@@ -1386,12 +1880,14 @@ class _RecorderScreenState extends State<RecorderScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final idle = _state == RecState.idle;
     return Scaffold(
       appBar: AppBar(
         title: const Text('Voice Notes'),
         actions: [
           IconButton(
             icon: const Icon(Icons.library_books),
+            tooltip: 'My notes',
             onPressed: () => Navigator.push(
               context,
               MaterialPageRoute(builder: (_) => const NotesScreen()),
@@ -1399,6 +1895,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
           ),
           IconButton(
             icon: const Icon(Icons.settings),
+            tooltip: 'Settings',
             onPressed: () => Navigator.push(
               context,
               MaterialPageRoute(builder: (_) => const SettingsScreen()),
@@ -1411,72 +1908,24 @@ class _RecorderScreenState extends State<RecorderScreen> {
         child: Column(
           children: [
             _errorBox(),
-            if (_state == RecState.idle && !_saving) _settings(),
-            if (_state == RecState.recording || _state == RecState.paused) ...[
-              _recordingReadingsDisplay(),
-              const SizedBox(height: 16),
-            ],
-            if (_state == RecState.preview) ...[
-              Card(
-                color: Theme.of(context).colorScheme.primaryContainer,
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Row(
-                    children: [
-                      const Icon(Icons.check_circle),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          'Recording finished (${_formatTime(_elapsedSeconds)}). Preview or save below!',
-                          style: TextStyle(color: Theme.of(context).colorScheme.onPrimaryContainer),
-                        ),
-                      ),
-                    ],
-                  ),
+            if (idle && !_saving && _saved == null) _idleTop(),
+            if (!idle) _meterCard(),
+            if (!idle)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(
+                  'Recording continues if you lock the screen or switch apps.',
+                  style: Theme.of(context).textTheme.labelSmall,
                 ),
               ),
-              const SizedBox(height: 12),
-            ],
-            Text(_statusLabel, style: Theme.of(context).textTheme.labelLarge),
+            const SizedBox(height: 8),
+            Expanded(child: _transcriptArea()),
             const SizedBox(height: 12),
-            Expanded(
-              child: Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: SingleChildScrollView(
-                  child: Text(
-                    _text.isEmpty ? 'Speak and watch your words appear simultaneously here...' : _text,
-                    style: Theme.of(context).textTheme.bodyLarge,
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 16),
             _controls(),
-            const SizedBox(height: 16),
+            const SizedBox(height: 12),
           ],
         ),
       ),
     );
-  }
-
-  String get _statusLabel {
-    if (_saving) return 'Processing final chunks...';
-    switch (_state) {
-      case RecState.idle:
-        return 'Ready. The first transcription downloads the speech model (internet needed once).';
-      case RecState.recording:
-        return _pending > 0
-            ? 'Transcribing speech chunks live...'
-            : 'Listening and converting simultaneously...';
-      case RecState.paused:
-        return 'Paused. Tap resume to continue or stop to preview.';
-      case RecState.preview:
-        return 'Review your simultaneous transcript and audio before saving.';
-    }
   }
 }
