@@ -1,9 +1,0 @@
-{
-  "name": "Voice To Words",
-  "short_name": "VoiceToWords",
-  "start_url": "./",
-  "display": "standalone",
-  "background_color": "#ffffff",
-  "theme_color": "#000000",
-  "description": "Voice-to-words application"
-}
