@@ -9,7 +9,6 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
-import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:google_mlkit_translation/google_mlkit_translation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -18,7 +17,6 @@ import 'package:record/record.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite/sqflite.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:whisper_flutter_new/whisper_flutter_new.dart';
 
 // ============================================================
@@ -30,70 +28,12 @@ class AppErrors {
   static void report(String message) => last.value = message;
 }
 
-// ============================================================
-// BACKGROUND RECORDING (Android foreground service)
-// Nothing here runs until the user taps Record.
-// ============================================================
-
+/// Background recording is switched off in this build (it will be
+/// added back separately). These do nothing for now.
 class RecordingService {
-  static bool _ready = false;
-
-  static void _init() {
-    if (_ready) return;
-    FlutterForegroundTask.init(
-      androidNotificationOptions: AndroidNotificationOptions(
-        channelId: 'voice_notes_recording',
-        channelName: 'Voice note recording',
-        channelDescription: 'Keeps recording while the app is in the background',
-        channelImportance: NotificationChannelImportance.LOW,
-        priority: NotificationPriority.LOW,
-      ),
-      iosNotificationOptions: const IOSNotificationOptions(),
-      foregroundTaskOptions: ForegroundTaskOptions(
-        eventAction: ForegroundTaskEventAction.nothing(),
-        allowWakeLock: true,
-        allowWifiLock: false,
-      ),
-    );
-    _ready = true;
-  }
-
-  static Future<void> start() async {
-    try {
-      _init();
-      final perm = await FlutterForegroundTask.checkNotificationPermission();
-      if (perm != NotificationPermission.granted) {
-        await FlutterForegroundTask.requestNotificationPermission();
-      }
-      if (await FlutterForegroundTask.isRunningService) return;
-      await FlutterForegroundTask.startService(
-        serviceId: 256,
-        serviceTypes: [ForegroundServiceTypes.microphone],
-        notificationTitle: 'Voice Notes',
-        notificationText: 'Recording in progress...',
-      );
-    } catch (e) {
-      AppErrors.report('Background recording could not start: $e');
-    }
-  }
-
-  static Future<void> update(String text) async {
-    try {
-      if (!_ready) return;
-      if (await FlutterForegroundTask.isRunningService) {
-        await FlutterForegroundTask.updateService(notificationText: text);
-      }
-    } catch (_) {}
-  }
-
-  static Future<void> stop() async {
-    try {
-      if (!_ready) return;
-      if (await FlutterForegroundTask.isRunningService) {
-        await FlutterForegroundTask.stopService();
-      }
-    } catch (_) {}
-  }
+  static Future<void> start() async {}
+  static Future<void> update(String text) async {}
+  static Future<void> stop() async {}
 }
 
 String fmtDuration(Duration d) {
@@ -814,23 +754,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
           const SizedBox(height: 24),
-          Text('Recording', style: Theme.of(context).textTheme.titleMedium),
-          ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: const Icon(Icons.battery_saver),
-            title: const Text('Allow background recording'),
-            subtitle: const Text(
-                'Stops the phone from closing the app when the screen is off'),
-            enabled: !_busy,
-            onTap: () => _run(() async {
-              final ok =
-                  await FlutterForegroundTask.isIgnoringBatteryOptimizations;
-              if (ok) return 'Already allowed';
-              await FlutterForegroundTask.requestIgnoreBatteryOptimization();
-              return 'Choose Allow in the box that appeared';
-            }),
-          ),
-          const SizedBox(height: 24),
           Text('Backup', style: Theme.of(context).textTheme.titleMedium),
           ListTile(
             contentPadding: EdgeInsets.zero,
@@ -1264,8 +1187,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
     _recInstance?.dispose();
     _tick.dispose();
     _scroll.dispose();
-    WakelockPlus.disable();
-    RecordingService.stop();
     super.dispose();
   }
 
@@ -1395,10 +1316,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
         _saved = null;
       });
       AppErrors.last.value = null;
-      try {
-        WakelockPlus.enable(); // keep the screen on while the app is open
-      } catch (_) {}
-      await RecordingService.start(); // keeps recording in the background
       final stream = await _rec.startStream(RecordConfig(
         encoder: AudioEncoder.pcm16bits,
         sampleRate: _rate,
@@ -1413,8 +1330,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
       );
     } catch (e) {
       _setError('Could not start recording: $e');
-      WakelockPlus.disable();
-      RecordingService.stop();
       if (mounted) setState(() => _state = RecState.idle);
     }
   }
@@ -1428,7 +1343,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
     try {
       await _rec.pause();
     } catch (_) {}
-    RecordingService.update('Paused');
     _flush();
   }
 
@@ -1437,7 +1351,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
     try {
       await _rec.resume();
     } catch (_) {}
-    RecordingService.update('Recording in progress...');
     setState(() {
       _state = RecState.recording;
       _previewPath = null;
@@ -1480,8 +1393,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
     try {
       await _rec.stop();
     } catch (_) {}
-    WakelockPlus.disable();
-    RecordingService.stop();
     _resetBuffers();
     if (mounted) {
       setState(() {
@@ -1503,10 +1414,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
     try {
       await _sub?.cancel();
       await _rec.stop();
-      WakelockPlus.disable();
       _flush();
       await _queue;
-      RecordingService.stop(); // transcription is done: remove notification
 
       final text = _text.trim();
       String? audio;
@@ -1526,7 +1435,6 @@ class _RecorderScreenState extends State<RecorderScreen> {
         if (mounted) setState(() => _saved = note);
       }
     } catch (e) {
-      RecordingService.stop();
       _setError('Could not save the note: $e');
     } finally {
       if (mounted) {
@@ -1940,7 +1848,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
               Padding(
                 padding: const EdgeInsets.only(top: 6),
                 child: Text(
-                  'Recording continues if you lock the screen or switch apps.',
+                  'Keep the app open and the screen on while recording.',
                   style: Theme.of(context).textTheme.labelSmall,
                 ),
               ),
