@@ -24,11 +24,16 @@ jobs:
         run: cp "$(find github -name main.dart | head -n 1)" app/lib/main.dart
       - name: Add packages
         working-directory: app
-        run: flutter pub add sqflite path path_provider record audioplayers pdf share_plus google_mlkit_translation archive:^3.6.1 whisper_flutter_new shared_preferences file_picker:^8.3.7
-      - name: Allow microphone and internet
+        run: flutter pub add sqflite path path_provider record audioplayers pdf share_plus google_mlkit_translation archive:^3.6.1 shared_preferences file_picker:^8.3.7 speech_to_text
+      - name: Allow microphone, internet and speech recognition
         run: |
           M=app/android/app/src/main/AndroidManifest.xml
           sed -i 's#<application#<uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.INTERNET"/>\n    <application#' $M
+          if grep -q "<queries>" $M; then
+            sed -i 's#<queries>#<queries>\n        <intent><action android:name="android.speech.RecognitionService"/></intent>#' $M
+          else
+            sed -i 's#</manifest>#    <queries><intent><action android:name="android.speech.RecognitionService"/></intent></queries>\n</manifest>#' $M
+          fi
           sed -i 's/android:label="voice_notes"/android:label="Voice Notes"/' $M
           cat $M
       - name: Raise minimum Android version
