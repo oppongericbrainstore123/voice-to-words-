@@ -16,8 +16,10 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:record/record.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:speech_to_text/speech_recognition_error.dart';
+import 'package:speech_to_text/speech_recognition_result.dart';
+import 'package:speech_to_text/speech_to_text.dart';
 import 'package:sqflite/sqflite.dart';
-import 'package:whisper_flutter_new/whisper_flutter_new.dart';
 
 // ============================================================
 // APP START + THEME + ERROR CATCHING
@@ -26,14 +28,6 @@ import 'package:whisper_flutter_new/whisper_flutter_new.dart';
 class AppErrors {
   static final ValueNotifier<String?> last = ValueNotifier(null);
   static void report(String message) => last.value = message;
-}
-
-/// Background recording is switched off in this build (it will be
-/// added back separately). These do nothing for now.
-class RecordingService {
-  static Future<void> start() async {}
-  static Future<void> update(String text) async {}
-  static Future<void> stop() async {}
 }
 
 String fmtDuration(Duration d) {
@@ -211,56 +205,10 @@ class NoteDb {
 }
 
 // ============================================================
-// WHISPER (speech to text)
+// AUDIO FILES (PCM -> WAV)
 // ============================================================
 
-class WhisperService {
-  WhisperService._();
-  static final WhisperService instance = WhisperService._();
-
-  // "tiny" is light and fast on phones. Switch to WhisperModel.base
-  // later for better accuracy on a faster phone.
-  Whisper? _whisperInstance;
-  Whisper get _whisper =>
-      _whisperInstance ??= Whisper(model: WhisperModel.tiny);
-
-  /// 'idle' | 'preparing' | 'ready' | 'error'
-  final ValueNotifier<String> status = ValueNotifier('idle');
-  String? lastError;
-
-  Future<void> _chain = Future.value();
-
-  /// Runs jobs one at a time so the engine is never used twice at once.
-  Future<T> _serial<T>(Future<T> Function() job) {
-    final c = Completer<T>();
-    _chain = _chain.then((_) async {
-      try {
-        c.complete(await job());
-      } catch (e, s) {
-        c.completeError(e, s);
-      }
-    });
-    return c.future;
-  }
-
-  /// Downloads/loads the model. Only runs when the user taps Download
-  /// (or on the first transcription).
-  Future<void> warmUp() async {
-    if (status.value == 'preparing' || status.value == 'ready') return;
-    status.value = 'preparing';
-    lastError = null;
-    try {
-      // 3 seconds of silence, enough to make the engine load its model.
-      await _serial(() => _run(Uint8List(96000), 'en'))
-          .timeout(const Duration(minutes: 15));
-      status.value = 'ready';
-    } catch (e) {
-      lastError = '$e';
-      status.value = 'error';
-      AppErrors.report('Speech model problem: $e');
-    }
-  }
-
+class AudioFiles {
   static Uint8List pcmToWav(Uint8List pcm, {int sampleRate = 16000}) {
     final h = ByteData(44);
     void s(int o, String t) {
@@ -289,39 +237,7 @@ class WhisperService {
     return b.toBytes();
   }
 
-  static String clean(String t) => t
-      .replaceAll(RegExp(r'\[[^\]]*\]|\([^)]*\)'), '')
-      .replaceAll(RegExp(r'\s+'), ' ')
-      .trim();
-
-  Future<String> _run(Uint8List pcm, String language) async {
-    final dir = await getTemporaryDirectory();
-    final f = File(
-        '${dir.path}/chunk_${DateTime.now().microsecondsSinceEpoch}.wav');
-    await f.writeAsBytes(pcmToWav(pcm));
-    try {
-      final r = await _whisper.transcribe(
-        transcribeRequest: TranscribeRequest(
-          audio: f.path,
-          language: language,
-          isTranslate: false,
-          isNoTimestamps: true,
-          splitOnWord: false,
-        ),
-      );
-      return clean(r.text);
-    } finally {
-      if (await f.exists()) await f.delete();
-    }
-  }
-
-  Future<String> transcribePcm(Uint8List pcm, {String language = 'auto'}) async {
-    final text = await _serial(() => _run(pcm, language));
-    if (status.value != 'ready') status.value = 'ready';
-    return text;
-  }
-
-  Future<String> saveWav(Uint8List pcm) async {
+  static Future<String> saveWav(Uint8List pcm) async {
     final dir = await getApplicationDocumentsDirectory();
     final path =
         '${dir.path}/note_${DateTime.now().millisecondsSinceEpoch}.wav';
@@ -331,7 +247,7 @@ class WhisperService {
 }
 
 // ============================================================
-// VOICE ISOLATION (optional noise filter)
+// VOICE ISOLATION (optional filter for the saved audio)
 // ============================================================
 
 class VoiceIsolator {
@@ -1125,6 +1041,8 @@ class WavePainter extends CustomPainter {
 
 // ============================================================
 // RECORDER SCREEN (home)
+// Live text comes from the phone's own speech recognition.
+// Audio is recorded at the same time for playback.
 // ============================================================
 
 enum RecState { idle, recording, paused }
@@ -1138,53 +1056,55 @@ class RecorderScreen extends StatefulWidget {
 
 class _RecorderScreenState extends State<RecorderScreen> {
   static const int _rate = 16000;
-  static const double _minSecs = 3; // earliest a chunk may be cut
-  static const double _maxSecs = 10; // forced cut
-  static const double _silenceRms = 500; // below this = pause in speech
-  static const double _quietNeeded = 0.35; // seconds of quiet to cut
-  static const double _skipPeak = 250; // chunks quieter than this are skipped
   static const int _slots = 48;
 
+  final SpeechToText _speech = SpeechToText();
   AudioRecorder? _recInstance;
   AudioRecorder get _rec => _recInstance ??= AudioRecorder();
   final VoiceIsolator _iso = VoiceIsolator();
   StreamSubscription<Uint8List>? _sub;
   final BytesBuilder _all = BytesBuilder(copy: false);
-  final BytesBuilder _chunk = BytesBuilder(copy: false);
-  int _chunkBytes = 0;
-  int _quietBytes = 0;
-  double _chunkPeak = 0;
-  Future<void> _queue = Future.value();
-  int _session = 0;
+  final Stopwatch _sw = Stopwatch();
+  Timer? _timer;
 
   final ValueNotifier<int> _tick = ValueNotifier(0);
   final List<double> _waves = [];
   double _db = -90;
+  double _recLevel = 0;
+  double _peakAll = 0;
   final ScrollController _scroll = ScrollController();
 
   RecState _state = RecState.idle;
   bool _saving = false;
   bool _isolate = false;
-  String _lang = 'auto';
-  String _text = '';
-  int _pending = 0;
+  bool _speechReady = false;
+  bool _restarting = false;
+  List<LocaleName> _locales = [];
+  String? _localeId;
+  String _committed = '';
+  String _partial = '';
   String? _error;
   String? _previewPath;
   Note? _saved;
+  String? _saveNote;
 
-  Duration get _elapsed =>
-      Duration(milliseconds: _all.length * 1000 ~/ (_rate * 2));
+  String get _fullText =>
+      [_committed, _partial].where((s) => s.isNotEmpty).join(' ');
 
   @override
   void initState() {
     super.initState();
-    _loadPrefs();
+    _loadPrefs().then((_) => _initSpeech());
   }
 
   @override
   void dispose() {
+    _timer?.cancel();
     _sub?.cancel();
     _recInstance?.dispose();
+    try {
+      _speech.cancel();
+    } catch (_) {}
     _tick.dispose();
     _scroll.dispose();
     super.dispose();
@@ -1195,7 +1115,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
       final prefs = await SharedPreferences.getInstance();
       if (!mounted) return;
       setState(() {
-        _lang = prefs.getString('lang') ?? 'auto';
+        _localeId = prefs.getString('locale');
         _isolate = prefs.getBool('isolate') ?? false;
       });
     } catch (_) {}
@@ -1204,7 +1124,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
   Future<void> _savePrefs() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('lang', _lang);
+      if (_localeId != null) await prefs.setString('locale', _localeId!);
       await prefs.setBool('isolate', _isolate);
     } catch (_) {}
   }
@@ -1212,6 +1132,109 @@ class _RecorderScreenState extends State<RecorderScreen> {
   void _setError(String m) {
     if (mounted) setState(() => _error = m);
   }
+
+  // ---------------- speech recognition ----------------
+
+  Future<void> _initSpeech() async {
+    try {
+      final ok = await _speech.initialize(
+        onStatus: _onSpeechStatus,
+        onError: _onSpeechError,
+      );
+      List<LocaleName> locales = [];
+      LocaleName? sys;
+      if (ok) {
+        locales = await _speech.locales();
+        sys = await _speech.systemLocale();
+      }
+      if (!mounted) return;
+      setState(() {
+        _speechReady = ok;
+        _locales = locales;
+        final saved = _localeId;
+        if (saved == null || !locales.any((l) => l.localeId == saved)) {
+          _localeId = sys?.localeId;
+        }
+      });
+    } catch (e) {
+      _setError('Speech recognition could not start: $e');
+    }
+  }
+
+  void _onSpeechError(SpeechRecognitionError e) {
+    if (e.permanent) {
+      _setError('Speech engine: ${e.errorMsg}');
+    }
+  }
+
+  void _onSpeechStatus(String s) {
+    // The phone's engine stops itself after a pause in speech.
+    // While recording, start it again so text keeps flowing.
+    if ((s == 'done' || s == 'notListening') &&
+        _state == RecState.recording &&
+        !_restarting) {
+      _restarting = true;
+      Future.delayed(const Duration(milliseconds: 400), () async {
+        _restarting = false;
+        if (_state == RecState.recording && mounted) {
+          setState(() {
+            _committed = _fullText;
+            _partial = '';
+          });
+          await _listen();
+        }
+      });
+    }
+  }
+
+  void _onSpeech(SpeechRecognitionResult r) {
+    if (_state == RecState.idle && !_saving) return;
+    if (!mounted) return;
+    setState(() {
+      _partial = r.recognizedWords;
+      if (r.finalResult) {
+        _committed = _fullText;
+        _partial = '';
+      }
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scroll.hasClients) {
+        _scroll.animateTo(
+          _scroll.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
+  Future<void> _listen() async {
+    if (!_speechReady) return;
+    try {
+      await _speech.listen(
+        onResult: _onSpeech,
+        localeId: _localeId,
+        listenFor: const Duration(minutes: 30),
+        pauseFor: const Duration(seconds: 10),
+        onSoundLevelChange: (level) {
+          // Used for the meter if the recorder is not getting sound.
+          if (_state == RecState.recording && _recLevel < 20) {
+            final v = ((level + 2) / 12).clamp(0.0, 1.0).toDouble();
+            _pushLevel(v, v * v * 8000);
+          }
+        },
+        listenOptions: SpeechListenOptions(
+          partialResults: true,
+          cancelOnError: false,
+          listenMode: ListenMode.dictation,
+        ),
+      );
+    } catch (e) {
+      _setError('Speech recognition error: $e');
+    }
+  }
+
+  // ---------------- audio recording ----------------
 
   double _rms(Uint8List d) {
     final n = d.length ~/ 2;
@@ -1225,109 +1248,86 @@ class _RecorderScreenState extends State<RecorderScreen> {
     return sqrt(sum / n);
   }
 
+  void _pushLevel(double v, double rms) {
+    _waves.add(v);
+    if (_waves.length > _slots) _waves.removeAt(0);
+    _db = rms < 1 ? -90 : 20 * log(rms / 32768) / ln10;
+    _tick.value++;
+  }
+
   void _onAudio(Uint8List raw) {
     if (_state != RecState.recording) return;
     final data = _isolate ? _iso.process(raw) : raw;
     final lvl = _rms(data);
-
+    _recLevel = lvl;
+    _peakAll = max(_peakAll, lvl);
     _all.add(data);
-    _chunk.add(data);
-    _chunkBytes += data.length;
-    _chunkPeak = max(_chunkPeak, lvl);
-    if (lvl < _silenceRms) {
-      _quietBytes += data.length;
-    } else {
-      _quietBytes = 0;
-    }
-
-    _waves.add(sqrt((lvl / 8000).clamp(0.0, 1.0)));
-    if (_waves.length > _slots) _waves.removeAt(0);
-    _db = lvl < 1 ? -90 : 20 * log(lvl / 32768) / ln10;
-    _tick.value++;
-
-    final secs = _chunkBytes / (_rate * 2);
-    final quietSecs = _quietBytes / (_rate * 2);
-    if (secs >= _minSecs && (secs >= _maxSecs || quietSecs >= _quietNeeded)) {
-      _flush();
-    }
+    _pushLevel(sqrt((lvl / 8000).clamp(0.0, 1.0)).toDouble(), lvl);
   }
 
-  void _flush() {
-    if (_chunkBytes < _rate * 2 * 0.3) return;
-    final bytes = _chunk.takeBytes();
-    final peak = _chunkPeak;
-    _chunkBytes = 0;
-    _quietBytes = 0;
-    _chunkPeak = 0;
-    if (peak < _skipPeak) return; // silence: nothing to transcribe
-
-    final session = _session;
-    if (mounted) setState(() => _pending++);
-    _queue = _queue.then((_) async {
-      try {
-        final t = await WhisperService.instance
-            .transcribePcm(bytes, language: _lang);
-        if (session == _session && t.isNotEmpty && mounted) {
-          setState(() => _text = _text.isEmpty ? t : '$_text $t');
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (_scroll.hasClients) {
-              _scroll.animateTo(
-                _scroll.position.maxScrollExtent,
-                duration: const Duration(milliseconds: 200),
-                curve: Curves.easeOut,
-              );
-            }
-          });
-        }
-      } catch (e) {
-        _setError('Transcription error: $e');
-      } finally {
-        if (mounted && session == _session) setState(() => _pending--);
-      }
-    });
-  }
-
-  void _resetBuffers() {
+  void _resetAll() {
     _all.clear();
-    _chunk.clear();
-    _chunkBytes = 0;
-    _quietBytes = 0;
-    _chunkPeak = 0;
+    _iso.reset();
     _waves.clear();
     _db = -90;
-    _iso.reset();
+    _recLevel = 0;
+    _peakAll = 0;
+    _committed = '';
+    _partial = '';
+    _sw
+      ..stop()
+      ..reset();
   }
+
+  // ---------------- controls ----------------
 
   Future<void> _start() async {
     try {
-      if (!await _rec.hasPermission()) {
+      if (!_speechReady) await _initSpeech();
+      final hasMic = await _rec.hasPermission();
+      if (!hasMic) {
         _setError('Microphone permission was not granted. '
             'Allow it in phone Settings > Apps > Voice Notes > Permissions.');
         return;
       }
-      _session++;
-      _resetBuffers();
+      _resetAll();
       setState(() {
         _state = RecState.recording;
-        _text = '';
-        _pending = 0;
         _error = null;
         _previewPath = null;
         _saved = null;
+        _saveNote = null;
       });
       AppErrors.last.value = null;
-      final stream = await _rec.startStream(RecordConfig(
-        encoder: AudioEncoder.pcm16bits,
-        sampleRate: _rate,
-        numChannels: 1,
-        noiseSuppress: _isolate,
-        echoCancel: _isolate,
-        autoGain: _isolate,
-      ));
-      _sub = stream.listen(
-        _onAudio,
-        onError: (e) => _setError('Microphone error: $e'),
-      );
+      _sw.start();
+      _timer?.cancel();
+      _timer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+        if (_state == RecState.recording) _tick.value++;
+      });
+
+      try {
+        final stream = await _rec.startStream(RecordConfig(
+          encoder: AudioEncoder.pcm16bits,
+          sampleRate: _rate,
+          numChannels: 1,
+          noiseSuppress: _isolate,
+          echoCancel: _isolate,
+          autoGain: _isolate,
+        ));
+        _sub = stream.listen(
+          _onAudio,
+          onError: (e) => _setError('Microphone error: $e'),
+        );
+      } catch (e) {
+        _setError('Audio could not be recorded: $e');
+      }
+
+      if (_speechReady) {
+        await _listen();
+      } else {
+        _setError('Speech recognition is not available on this phone. '
+            'Audio is still being recorded.');
+      }
     } catch (e) {
       _setError('Could not start recording: $e');
       if (mounted) setState(() => _state = RecState.idle);
@@ -1340,10 +1340,19 @@ class _RecorderScreenState extends State<RecorderScreen> {
       _state = RecState.paused;
       _previewPath = null;
     });
+    _sw.stop();
+    try {
+      await _speech.stop();
+    } catch (_) {}
     try {
       await _rec.pause();
     } catch (_) {}
-    _flush();
+    if (mounted) {
+      setState(() {
+        _committed = _fullText;
+        _partial = '';
+      });
+    }
   }
 
   Future<void> _resume() async {
@@ -1351,20 +1360,25 @@ class _RecorderScreenState extends State<RecorderScreen> {
     try {
       await _rec.resume();
     } catch (_) {}
+    _sw.start();
     setState(() {
       _state = RecState.recording;
       _previewPath = null;
     });
+    await _listen();
   }
 
   /// Lets the user hear everything recorded so far (while paused).
   Future<void> _listenSoFar() async {
-    if (_all.length == 0) return;
+    if (_all.length == 0) {
+      _setError('No audio has been captured yet.');
+      return;
+    }
     try {
       final dir = await getTemporaryDirectory();
       final path =
           '${dir.path}/preview_${DateTime.now().millisecondsSinceEpoch}.wav';
-      await File(path).writeAsBytes(WhisperService.pcmToWav(_all.toBytes()));
+      await File(path).writeAsBytes(AudioFiles.pcmToWav(_all.toBytes()));
       if (mounted) setState(() => _previewPath = path);
     } catch (e) {
       _setError('Could not prepare playback: $e');
@@ -1388,17 +1402,18 @@ class _RecorderScreenState extends State<RecorderScreen> {
       ),
     );
     if (ok != true) return;
-    _session++; // ignore any text still being transcribed
+    _timer?.cancel();
+    try {
+      await _speech.cancel();
+    } catch (_) {}
     await _sub?.cancel();
     try {
       await _rec.stop();
     } catch (_) {}
-    _resetBuffers();
     if (mounted) {
       setState(() {
         _state = RecState.idle;
-        _text = '';
-        _pending = 0;
+        _resetAll();
         _previewPath = null;
       });
     }
@@ -1411,28 +1426,48 @@ class _RecorderScreenState extends State<RecorderScreen> {
       _saving = true;
       _previewPath = null;
     });
+    _timer?.cancel();
+    _sw.stop();
     try {
-      await _sub?.cancel();
-      await _rec.stop();
-      _flush();
-      await _queue;
+      try {
+        await _speech.stop();
+      } catch (_) {}
+      // Give the engine a moment to deliver the last words.
+      await Future.delayed(const Duration(milliseconds: 700));
+      try {
+        await _sub?.cancel();
+        await _rec.stop();
+      } catch (_) {}
 
-      final text = _text.trim();
+      final text = _fullText.trim();
       String? audio;
-      if (_all.length > _rate * 2 ~/ 2) {
-        audio = await WhisperService.instance.saveWav(_all.toBytes());
+      String? note;
+      if (_all.length > _rate) {
+        if (_peakAll >= 60) {
+          audio = await AudioFiles.saveWav(_all.toBytes());
+        } else {
+          note = 'The audio could not be captured (the phone used the '
+              'microphone for speech recognition), so only the text was saved.';
+        }
       }
       if (text.isNotEmpty || audio != null) {
         final words = text.split(RegExp(r'\s+')).take(6).join(' ');
-        final note = Note(
+        final n = Note(
           title: words.isEmpty ? 'Voice note' : words,
           transcript: text,
           audioPath: audio,
           createdAt: DateTime.now(),
-          locale: _lang == 'auto' ? null : _lang,
+          locale: _localeId,
         );
-        note.id = await NoteDb.instance.insert(note);
-        if (mounted) setState(() => _saved = note);
+        n.id = await NoteDb.instance.insert(n);
+        if (mounted) {
+          setState(() {
+            _saved = n;
+            _saveNote = note;
+          });
+        }
+      } else {
+        _setError('Nothing was recorded. Check the microphone and try again.');
       }
     } catch (e) {
       _setError('Could not save the note: $e');
@@ -1440,7 +1475,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
       if (mounted) {
         setState(() {
           _saving = false;
-          _text = '';
+          _committed = '';
+          _partial = '';
         });
       }
     }
@@ -1477,87 +1513,57 @@ class _RecorderScreenState extends State<RecorderScreen> {
     );
   }
 
-  Widget _modelStatus() {
-    return ValueListenableBuilder<String>(
-      valueListenable: WhisperService.instance.status,
-      builder: (context, s, _) {
-        if (s == 'ready') {
-          return const Row(children: [
-            Icon(Icons.check_circle, size: 18, color: Colors.green),
-            SizedBox(width: 8),
-            Expanded(child: Text('Speech model ready. Works offline.')),
-          ]);
-        }
-        if (s == 'error') {
-          return Row(children: [
-            const Icon(Icons.error_outline, size: 18, color: Colors.red),
-            const SizedBox(width: 8),
-            const Expanded(
-                child: Text('Speech model could not load. Check internet.')),
-            TextButton(
-              onPressed: () => WhisperService.instance.warmUp(),
-              child: const Text('Retry'),
-            ),
-          ]);
-        }
-        if (s == 'idle') {
-          return Row(children: [
-            const Icon(Icons.download_for_offline, size: 18),
-            const SizedBox(width: 8),
-            const Expanded(child: Text('Speech model not downloaded yet.')),
-            FilledButton.tonal(
-              onPressed: () => WhisperService.instance.warmUp(),
-              child: const Text('Download'),
-            ),
-          ]);
-        }
-        return const Row(children: [
-          SizedBox(
-              width: 16,
-              height: 16,
-              child: CircularProgressIndicator(strokeWidth: 2)),
-          SizedBox(width: 8),
-          Expanded(
-              child: Text(
-                  'Downloading speech model. Keep the app open and internet on...')),
-        ]);
-      },
-    );
+  Widget _speechStatus() {
+    if (_speechReady) {
+      return const Row(children: [
+        Icon(Icons.check_circle, size: 18, color: Colors.green),
+        SizedBox(width: 8),
+        Expanded(child: Text('Speech recognition ready.')),
+      ]);
+    }
+    return Row(children: [
+      const Icon(Icons.error_outline, size: 18, color: Colors.orange),
+      const SizedBox(width: 8),
+      const Expanded(
+          child: Text('Speech recognition not available yet.')),
+      TextButton(onPressed: _initSpeech, child: const Text('Retry')),
+    ]);
   }
 
   Widget _idleTop() {
+    final hasLocale =
+        _localeId != null && _locales.any((l) => l.localeId == _localeId);
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(
           children: [
-            _modelStatus(),
+            _speechStatus(),
             const SizedBox(height: 8),
-            DropdownButtonFormField<String>(
-              value: _lang,
-              isExpanded: true,
-              decoration: const InputDecoration(
-                labelText: 'Speaking language',
-                helperText: 'Choosing your language is more accurate than Auto',
+            if (_locales.isNotEmpty)
+              DropdownButtonFormField<String>(
+                value: hasLocale ? _localeId : null,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                  labelText: 'Speaking language',
+                  helperText: 'For offline use, download this language in '
+                      'your phone voice settings',
+                ),
+                items: _locales
+                    .map((l) => DropdownMenuItem(
+                          value: l.localeId,
+                          child: Text(l.name, overflow: TextOverflow.ellipsis),
+                        ))
+                    .toList(),
+                onChanged: (v) {
+                  setState(() => _localeId = v);
+                  _savePrefs();
+                },
               ),
-              items: [
-                const DropdownMenuItem(
-                    value: 'auto', child: Text('Auto-detect')),
-                ...TranslationService.languages.map((l) => DropdownMenuItem(
-                      value: l.bcpCode,
-                      child: Text(TranslationService.label(l)),
-                    )),
-              ],
-              onChanged: (v) {
-                setState(() => _lang = v ?? 'auto');
-                _savePrefs();
-              },
-            ),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
               title: const Text('Voice isolation'),
-              subtitle:
-                  const Text('Filters background noise (may cut quiet voices)'),
+              subtitle: const Text('Cleans background noise in the saved audio'),
               value: _isolate,
               onChanged: (v) {
                 setState(() => _isolate = v);
@@ -1605,7 +1611,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
                           color: paused ? scheme.outline : Colors.red),
                       const SizedBox(width: 8),
                       Text(
-                        fmtDuration(_elapsed),
+                        fmtDuration(_sw.elapsed),
                         style: Theme.of(context).textTheme.headlineMedium,
                       ),
                     ]),
@@ -1650,7 +1656,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
           children: [
             CircularProgressIndicator(),
             SizedBox(height: 12),
-            Text('Finishing transcription and saving...'),
+            Text('Saving...'),
           ],
         ),
       );
@@ -1677,6 +1683,12 @@ class _RecorderScreenState extends State<RecorderScreen> {
                   const SizedBox(height: 12),
                   if (n.audioPath != null)
                     PlayerBar(key: ValueKey(n.audioPath), path: n.audioPath!),
+                  if (_saveNote != null)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Text(_saveNote!,
+                          style: Theme.of(context).textTheme.bodySmall),
+                    ),
                   const SizedBox(height: 8),
                   SelectableText(n.transcript.isEmpty
                       ? '(No speech was detected)'
@@ -1698,7 +1710,10 @@ class _RecorderScreenState extends State<RecorderScreen> {
                         },
                       ),
                       OutlinedButton(
-                        onPressed: () => setState(() => _saved = null),
+                        onPressed: () => setState(() {
+                          _saved = null;
+                          _saveNote = null;
+                        }),
                         child: const Text('Done'),
                       ),
                     ],
@@ -1715,25 +1730,11 @@ class _RecorderScreenState extends State<RecorderScreen> {
       return const Center(child: Text('Tap the mic to start recording'));
     }
 
+    final text = _fullText;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(children: [
-          Text('Live transcript',
-              style: Theme.of(context).textTheme.titleSmall),
-          const SizedBox(width: 8),
-          if (_pending > 0)
-            const SizedBox(
-                width: 12,
-                height: 12,
-                child: CircularProgressIndicator(strokeWidth: 2)),
-          if (_pending > 0)
-            Padding(
-              padding: const EdgeInsets.only(left: 6),
-              child: Text('transcribing...',
-                  style: Theme.of(context).textTheme.labelSmall),
-            ),
-        ]),
+        Text('Live transcript', style: Theme.of(context).textTheme.titleSmall),
         const SizedBox(height: 8),
         if (_state == RecState.paused && _previewPath != null)
           PlayerBar(key: ValueKey(_previewPath), path: _previewPath!),
@@ -1743,9 +1744,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
             child: SizedBox(
               width: double.infinity,
               child: Text(
-                _text.isEmpty
-                    ? 'Start speaking. Text appears after each phrase...'
-                    : _text,
+                text.isEmpty ? 'Start speaking. Your words appear here...' : text,
                 style: Theme.of(context).textTheme.bodyLarge,
               ),
             ),
