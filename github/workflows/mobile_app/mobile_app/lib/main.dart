@@ -1041,8 +1041,13 @@ class WavePainter extends CustomPainter {
 
 // ============================================================
 // RECORDER SCREEN (home)
-// Live text comes from the phone's own speech recognition.
-// Audio is recorded at the same time for playback.
+//
+// Default: live text only. The phone's speech engine uses the
+// microphone alone, so words appear as you speak.
+//
+// Optional "Also save audio": records sound for playback, but the
+// phone usually lets only one app part use the microphone, so
+// live text may stop on some phones when this is on.
 // ============================================================
 
 enum RecState { idle, recording, paused }
@@ -1076,6 +1081,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
 
   RecState _state = RecState.idle;
   bool _saving = false;
+  bool _saveAudio = false; // the switch on the home screen
+  bool _audioOn = false; // what this recording actually uses
   bool _isolate = false;
   bool _speechReady = false;
   bool _restarting = false;
@@ -1083,6 +1090,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
   String? _localeId;
   String _committed = '';
   String _partial = '';
+  String _engine = 'idle';
+  String _lastErr = '';
+  int _results = 0;
   String? _error;
   String? _previewPath;
   Note? _saved;
@@ -1116,7 +1126,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
       if (!mounted) return;
       setState(() {
         _localeId = prefs.getString('locale');
-        _isolate = prefs.getBool('isolate') ?? false;
+        _saveAudio = prefs.getBool('save_audio') ?? false;
+        _isolate = prefs.getBool('isolate_v2') ?? false;
       });
     } catch (_) {}
   }
@@ -1125,7 +1136,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
     try {
       final prefs = await SharedPreferences.getInstance();
       if (_localeId != null) await prefs.setString('locale', _localeId!);
-      await prefs.setBool('isolate', _isolate);
+      await prefs.setBool('save_audio', _saveAudio);
+      await prefs.setBool('isolate_v2', _isolate);
     } catch (_) {}
   }
 
@@ -1161,20 +1173,43 @@ class _RecorderScreenState extends State<RecorderScreen> {
     }
   }
 
-  void _onSpeechError(SpeechRecognitionError e) {
-    if (e.permanent) {
-      _setError('Speech engine: ${e.errorMsg}');
+  String _friendlyError(String m) {
+    if (m.contains('network') || m.contains('server')) {
+      return 'The speech engine could not reach the internet. Turn on '
+          'mobile data or Wi-Fi, or download your language for offline use '
+          '(Google app > Settings > Voice > Offline speech recognition).';
     }
+    if (m.contains('language')) {
+      return 'This language is not available for speech recognition. '
+          'Pick another language or download it in your phone voice settings.';
+    }
+    if (m.contains('permission')) {
+      return 'Microphone permission is missing. Allow it in phone Settings > '
+          'Apps > Voice Notes > Permissions.';
+    }
+    if (m.contains('busy')) {
+      return 'The microphone is busy. Close other apps that use it '
+          '(calls, voice recorders) and try again.';
+    }
+    return 'Speech engine: $m';
+  }
+
+  void _onSpeechError(SpeechRecognitionError e) {
+    final m = e.errorMsg;
+    if (mounted) setState(() => _lastErr = m);
+    if (m == 'error_no_match' || m == 'error_speech_timeout') return;
+    _setError(_friendlyError(m));
   }
 
   void _onSpeechStatus(String s) {
+    if (mounted) setState(() => _engine = s);
     // The phone's engine stops itself after a pause in speech.
     // While recording, start it again so text keeps flowing.
     if ((s == 'done' || s == 'notListening') &&
         _state == RecState.recording &&
         !_restarting) {
       _restarting = true;
-      Future.delayed(const Duration(milliseconds: 400), () async {
+      Future.delayed(const Duration(milliseconds: 500), () async {
         _restarting = false;
         if (_state == RecState.recording && mounted) {
           setState(() {
@@ -1188,9 +1223,10 @@ class _RecorderScreenState extends State<RecorderScreen> {
   }
 
   void _onSpeech(SpeechRecognitionResult r) {
-    if (_state == RecState.idle && !_saving) return;
     if (!mounted) return;
+    if (_state == RecState.idle && !_saving) return;
     setState(() {
+      _results++;
       _partial = r.recognizedWords;
       if (r.finalResult) {
         _committed = _fullText;
@@ -1217,11 +1253,11 @@ class _RecorderScreenState extends State<RecorderScreen> {
         listenFor: const Duration(minutes: 30),
         pauseFor: const Duration(seconds: 10),
         onSoundLevelChange: (level) {
-          // Used for the meter if the recorder is not getting sound.
-          if (_state == RecState.recording && _recLevel < 20) {
-            final v = ((level + 2) / 12).clamp(0.0, 1.0).toDouble();
-            _pushLevel(v, v * v * 8000);
-          }
+          if (_state != RecState.recording) return;
+          // Use the engine's own level unless the recorder is working.
+          if (_audioOn && _recLevel >= 20) return;
+          final v = ((level + 2) / 12).clamp(0.0, 1.0).toDouble();
+          _pushLevel(v, -60 + v * 55);
         },
         listenOptions: SpeechListenOptions(
           partialResults: true,
@@ -1234,7 +1270,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
     }
   }
 
-  // ---------------- audio recording ----------------
+  // ---------------- audio recording (optional) ----------------
 
   double _rms(Uint8List d) {
     final n = d.length ~/ 2;
@@ -1248,10 +1284,10 @@ class _RecorderScreenState extends State<RecorderScreen> {
     return sqrt(sum / n);
   }
 
-  void _pushLevel(double v, double rms) {
+  void _pushLevel(double v, double db) {
     _waves.add(v);
     if (_waves.length > _slots) _waves.removeAt(0);
-    _db = rms < 1 ? -90 : 20 * log(rms / 32768) / ln10;
+    _db = db;
     _tick.value++;
   }
 
@@ -1262,7 +1298,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
     _recLevel = lvl;
     _peakAll = max(_peakAll, lvl);
     _all.add(data);
-    _pushLevel(sqrt((lvl / 8000).clamp(0.0, 1.0)).toDouble(), lvl);
+    final v = sqrt((lvl / 8000).clamp(0.0, 1.0)).toDouble();
+    final db = lvl < 1 ? -90.0 : 20 * log(lvl / 32768) / ln10;
+    _pushLevel(v, db);
   }
 
   void _resetAll() {
@@ -1284,48 +1322,62 @@ class _RecorderScreenState extends State<RecorderScreen> {
   Future<void> _start() async {
     try {
       if (!_speechReady) await _initSpeech();
-      final hasMic = await _rec.hasPermission();
-      if (!hasMic) {
-        _setError('Microphone permission was not granted. '
-            'Allow it in phone Settings > Apps > Voice Notes > Permissions.');
+      if (_saveAudio) {
+        final hasMic = await _rec.hasPermission();
+        if (!hasMic) {
+          _setError('Microphone permission was not granted. '
+              'Allow it in phone Settings > Apps > Voice Notes > Permissions.');
+          return;
+        }
+      } else if (!_speechReady) {
+        _setError('Speech recognition is not available on this phone. '
+            'Check that the Google app is installed and updated, then tap '
+            'Retry. Or turn on "Also save audio" to record sound only.');
         return;
       }
+
       _resetAll();
+      _audioOn = _saveAudio;
       setState(() {
         _state = RecState.recording;
         _error = null;
         _previewPath = null;
         _saved = null;
         _saveNote = null;
+        _lastErr = '';
+        _results = 0;
+        _engine = 'starting';
       });
       AppErrors.last.value = null;
       _sw.start();
       _timer?.cancel();
-      _timer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      _timer = Timer.periodic(const Duration(milliseconds: 250), (_) {
         if (_state == RecState.recording) _tick.value++;
       });
 
-      try {
-        final stream = await _rec.startStream(RecordConfig(
-          encoder: AudioEncoder.pcm16bits,
-          sampleRate: _rate,
-          numChannels: 1,
-          noiseSuppress: _isolate,
-          echoCancel: _isolate,
-          autoGain: _isolate,
-        ));
-        _sub = stream.listen(
-          _onAudio,
-          onError: (e) => _setError('Microphone error: $e'),
-        );
-      } catch (e) {
-        _setError('Audio could not be recorded: $e');
+      if (_audioOn) {
+        try {
+          final stream = await _rec.startStream(RecordConfig(
+            encoder: AudioEncoder.pcm16bits,
+            sampleRate: _rate,
+            numChannels: 1,
+            noiseSuppress: _isolate,
+            echoCancel: _isolate,
+            autoGain: _isolate,
+          ));
+          _sub = stream.listen(
+            _onAudio,
+            onError: (e) => _setError('Microphone error: $e'),
+          );
+        } catch (e) {
+          _setError('Audio could not be recorded: $e');
+        }
       }
 
       if (_speechReady) {
         await _listen();
-      } else {
-        _setError('Speech recognition is not available on this phone. '
+      } else if (_audioOn) {
+        _setError('Speech recognition is not available. '
             'Audio is still being recorded.');
       }
     } catch (e) {
@@ -1344,9 +1396,11 @@ class _RecorderScreenState extends State<RecorderScreen> {
     try {
       await _speech.stop();
     } catch (_) {}
-    try {
-      await _rec.pause();
-    } catch (_) {}
+    if (_audioOn) {
+      try {
+        await _rec.pause();
+      } catch (_) {}
+    }
     if (mounted) {
       setState(() {
         _committed = _fullText;
@@ -1357,9 +1411,11 @@ class _RecorderScreenState extends State<RecorderScreen> {
 
   Future<void> _resume() async {
     if (_state != RecState.paused) return;
-    try {
-      await _rec.resume();
-    } catch (_) {}
+    if (_audioOn) {
+      try {
+        await _rec.resume();
+      } catch (_) {}
+    }
     _sw.start();
     setState(() {
       _state = RecState.recording;
@@ -1368,7 +1424,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
     await _listen();
   }
 
-  /// Lets the user hear everything recorded so far (while paused).
+  /// Lets the user hear everything recorded so far (audio mode only).
   Future<void> _listenSoFar() async {
     if (_all.length == 0) {
       _setError('No audio has been captured yet.');
@@ -1407,9 +1463,11 @@ class _RecorderScreenState extends State<RecorderScreen> {
       await _speech.cancel();
     } catch (_) {}
     await _sub?.cancel();
-    try {
-      await _rec.stop();
-    } catch (_) {}
+    if (_audioOn) {
+      try {
+        await _rec.stop();
+      } catch (_) {}
+    }
     if (mounted) {
       setState(() {
         _state = RecState.idle;
@@ -1433,23 +1491,29 @@ class _RecorderScreenState extends State<RecorderScreen> {
         await _speech.stop();
       } catch (_) {}
       // Give the engine a moment to deliver the last words.
-      await Future.delayed(const Duration(milliseconds: 700));
-      try {
-        await _sub?.cancel();
-        await _rec.stop();
-      } catch (_) {}
+      await Future.delayed(const Duration(milliseconds: 800));
+      if (_audioOn) {
+        try {
+          await _sub?.cancel();
+          await _rec.stop();
+        } catch (_) {}
+      }
 
       final text = _fullText.trim();
       String? audio;
       String? note;
-      if (_all.length > _rate) {
-        if (_peakAll >= 60) {
+      if (_audioOn) {
+        if (_all.length > _rate && _peakAll >= 60) {
           audio = await AudioFiles.saveWav(_all.toBytes());
         } else {
-          note = 'The audio could not be captured (the phone used the '
-              'microphone for speech recognition), so only the text was saved.';
+          note = 'The audio could not be captured (the phone gave the '
+              'microphone to speech recognition), so only the text was saved.';
         }
+      } else {
+        note = 'Audio was not saved. Turn on "Also save audio" on the home '
+            'screen to keep recordings.';
       }
+
       if (text.isNotEmpty || audio != null) {
         final words = text.split(RegExp(r'\s+')).take(6).join(' ');
         final n = Note(
@@ -1467,7 +1531,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
           });
         }
       } else {
-        _setError('Nothing was recorded. Check the microphone and try again.');
+        _setError('Nothing was captured. Speak clearly near the microphone, '
+            'check the speech status line, and make sure the phone has '
+            'internet or an offline language downloaded.');
       }
     } catch (e) {
       _setError('Could not save the note: $e');
@@ -1524,8 +1590,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
     return Row(children: [
       const Icon(Icons.error_outline, size: 18, color: Colors.orange),
       const SizedBox(width: 8),
-      const Expanded(
-          child: Text('Speech recognition not available yet.')),
+      const Expanded(child: Text('Speech recognition not available yet.')),
       TextButton(onPressed: _initSpeech, child: const Text('Retry')),
     ]);
   }
@@ -1562,14 +1627,28 @@ class _RecorderScreenState extends State<RecorderScreen> {
               ),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
-              title: const Text('Voice isolation'),
-              subtitle: const Text('Cleans background noise in the saved audio'),
-              value: _isolate,
+              title: const Text('Also save audio'),
+              subtitle: const Text(
+                  'Lets you play the recording back. On many phones this '
+                  'blocks live text, so leave it off for reliable text.'),
+              value: _saveAudio,
               onChanged: (v) {
-                setState(() => _isolate = v);
+                setState(() => _saveAudio = v);
                 _savePrefs();
               },
             ),
+            if (_saveAudio)
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Voice isolation'),
+                subtitle:
+                    const Text('Cleans background noise in the saved audio'),
+                value: _isolate,
+                onChanged: (v) {
+                  setState(() => _isolate = v);
+                  _savePrefs();
+                },
+              ),
           ],
         ),
       ),
@@ -1636,7 +1715,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
                     Text('${_db.round()} dB',
                         style: Theme.of(context).textTheme.labelMedium),
                     Text(
-                        '${(_all.length / 1024 / 1024).toStringAsFixed(1)} MB',
+                        _audioOn
+                            ? '${(_all.length / 1024 / 1024).toStringAsFixed(1)} MB'
+                            : 'Live text only',
                         style: Theme.of(context).textTheme.labelMedium),
                   ],
                 ),
@@ -1735,6 +1816,12 @@ class _RecorderScreenState extends State<RecorderScreen> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text('Live transcript', style: Theme.of(context).textTheme.titleSmall),
+        const SizedBox(height: 4),
+        Text(
+          'Speech engine: $_engine  |  results: $_results'
+          '${_lastErr.isEmpty ? '' : '  |  last error: $_lastErr'}',
+          style: Theme.of(context).textTheme.labelSmall,
+        ),
         const SizedBox(height: 8),
         if (_state == RecState.paused && _previewPath != null)
           PlayerBar(key: ValueKey(_previewPath), path: _previewPath!),
@@ -1790,12 +1877,13 @@ class _RecorderScreenState extends State<RecorderScreen> {
         return Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            FilledButton.tonalIcon(
-              onPressed: _listenSoFar,
-              icon: const Icon(Icons.headphones),
-              label: const Text('Listen so far'),
-            ),
-            const SizedBox(height: 12),
+            if (_audioOn)
+              FilledButton.tonalIcon(
+                onPressed: _listenSoFar,
+                icon: const Icon(Icons.headphones),
+                label: const Text('Listen so far'),
+              ),
+            if (_audioOn) const SizedBox(height: 12),
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               crossAxisAlignment: CrossAxisAlignment.end,
