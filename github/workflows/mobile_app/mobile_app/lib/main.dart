@@ -326,6 +326,13 @@ class VoiceIsolator {
 // TRANSLATION
 // ============================================================
 
+class TranslationException implements Exception {
+  final String message;
+  TranslationException(this.message);
+  @override
+  String toString() => message;
+}
+
 class TranslationService {
   static OnDeviceTranslatorModelManager? _managerInstance;
   static OnDeviceTranslatorModelManager get _manager =>
@@ -344,20 +351,82 @@ class TranslationService {
     );
   }
 
+  static Future<bool> hasInternet() async {
+    try {
+      final r = await InternetAddress.lookup('google.com')
+          .timeout(const Duration(seconds: 6));
+      return r.isNotEmpty && r.first.rawAddress.isNotEmpty;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> _ensureModel(
+    TranslateLanguage l,
+    void Function(String) status,
+  ) async {
+    bool have = false;
+    try {
+      have = await _manager.isModelDownloaded(l.bcpCode);
+    } catch (_) {}
+    if (have) return;
+
+    if (!await hasInternet()) {
+      throw TranslationException(
+          'No internet. Connect to Wi-Fi or mobile data once so the app can '
+          'download the ${label(l)} language pack (about 30 MB). After that, '
+          'translation works offline.');
+    }
+
+    status('Downloading ${label(l)} pack (about 30 MB)...');
+    bool ok = false;
+    try {
+      ok = await _manager
+          .downloadModel(l.bcpCode, isWifiRequired: false)
+          .timeout(const Duration(minutes: 5), onTimeout: () => false);
+    } catch (e) {
+      throw TranslationException(
+          'The ${label(l)} language pack could not be downloaded: $e');
+    }
+    if (!ok) {
+      throw TranslationException(
+          'The ${label(l)} language pack did not finish downloading. '
+          'Check your connection and try again.');
+    }
+  }
+
   static Future<String> translate(
     String text,
     TranslateLanguage from,
-    TranslateLanguage to,
-  ) async {
-    for (final l in [from, to]) {
-      if (!await _manager.isModelDownloaded(l.bcpCode)) {
-        await _manager.downloadModel(l.bcpCode, isWifiRequired: false);
-      }
-    }
+    TranslateLanguage to, {
+    void Function(String)? onStatus,
+  }) async {
+    final status = onStatus ?? (String s) {};
+    if (from == to) return text;
+
+    await _ensureModel(from, status);
+    await _ensureModel(to, status);
+
+    status('Translating...');
     final translator =
         OnDeviceTranslator(sourceLanguage: from, targetLanguage: to);
     try {
-      return await translator.translateText(text);
+      final outLines = <String>[];
+      for (final line in text.split('\n')) {
+        final trimmed = line.trim();
+        if (trimmed.isEmpty) {
+          outLines.add('');
+          continue;
+        }
+        final words = trimmed.split(RegExp(r'\s+'));
+        final pieces = <String>[];
+        for (var i = 0; i < words.length; i += 60) {
+          final chunk = words.sublist(i, min(i + 60, words.length)).join(' ');
+          pieces.add(await translator.translateText(chunk));
+        }
+        outLines.add(pieces.join(' '));
+      }
+      return outLines.join('\n');
     } finally {
       await translator.close();
     }
@@ -825,6 +894,7 @@ class _EditorScreenState extends State<EditorScreen> {
   late TranslateLanguage _from;
   late TranslateLanguage _to;
   bool _busy = false;
+  String _status = '';
 
   @override
   void initState() {
@@ -853,6 +923,21 @@ class _EditorScreenState extends State<EditorScreen> {
   void _msg(String s) =>
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(s)));
 
+  Future<void> _showProblem(String m) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Translation problem'),
+        content: SingleChildScrollView(child: SelectableText(m)),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('OK')),
+        ],
+      ),
+    );
+  }
+
   Future<void> _save({bool quiet = false}) async {
     final n = widget.note;
     n.title = _title.text.trim().isEmpty ? 'Voice note' : _title.text.trim();
@@ -865,17 +950,36 @@ class _EditorScreenState extends State<EditorScreen> {
 
   Future<void> _translate() async {
     if (_text.text.trim().isEmpty) return;
-    setState(() => _busy = true);
+    if (_from == _to) {
+      _msg('Choose two different languages.');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _status = 'Starting...';
+    });
     try {
-      final result =
-          await TranslationService.translate(_text.text, _from, _to);
+      final result = await TranslationService.translate(
+        _text.text,
+        _from,
+        _to,
+        onStatus: (s) {
+          if (mounted) setState(() => _status = s);
+        },
+      );
       _translation.text = result;
       await _save(quiet: true);
+    } on TranslationException catch (e) {
+      await _showProblem(e.message);
     } catch (e) {
-      _msg('Translation failed. The first use of a language needs internet '
-          'to download its pack.');
+      await _showProblem('Translation failed: $e');
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _status = '';
+        });
+      }
     }
   }
 
@@ -989,7 +1093,14 @@ class _EditorScreenState extends State<EditorScreen> {
                       height: 16,
                       child: CircularProgressIndicator(strokeWidth: 2))
                   : const Icon(Icons.translate),
-              label: Text(_busy ? 'Translating...' : 'Translate'),
+              label: Text(_busy
+                  ? (_status.isEmpty ? 'Working...' : _status)
+                  : 'Translate'),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'Needs internet once for each language. Works offline after that.',
+              style: Theme.of(context).textTheme.labelSmall,
             ),
             const SizedBox(height: 16),
             TextField(
@@ -1037,6 +1148,86 @@ class WavePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant WavePainter old) => true;
+}
+
+// ============================================================
+// SPEAKING LANGUAGE PICKER (searchable list)
+// ============================================================
+
+class LanguageSheet extends StatefulWidget {
+  final List<LocaleName> locales;
+  final String? selected;
+  const LanguageSheet({
+    super.key,
+    required this.locales,
+    required this.selected,
+  });
+
+  @override
+  State<LanguageSheet> createState() => _LanguageSheetState();
+}
+
+class _LanguageSheetState extends State<LanguageSheet> {
+  String _q = '';
+
+  @override
+  Widget build(BuildContext context) {
+    final q = _q.toLowerCase();
+    final list = widget.locales
+        .where((l) =>
+            l.name.toLowerCase().contains(q) ||
+            l.localeId.toLowerCase().contains(q))
+        .toList()
+      ..sort((a, b) => a.name.compareTo(b.name));
+    final h = MediaQuery.of(context).size.height * 0.75;
+    return Padding(
+      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      child: SizedBox(
+        height: h,
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+              child: TextField(
+                decoration: const InputDecoration(
+                  prefixIcon: Icon(Icons.search),
+                  hintText: 'Search language (French, Yoruba, Hindi...)',
+                  border: OutlineInputBorder(),
+                ),
+                onChanged: (v) => setState(() => _q = v),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  '${list.length} languages available on this phone',
+                  style: Theme.of(context).textTheme.labelSmall,
+                ),
+              ),
+            ),
+            Expanded(
+              child: ListView.builder(
+                itemCount: list.length,
+                itemBuilder: (context, i) {
+                  final l = list[i];
+                  final sel = l.localeId == widget.selected;
+                  return ListTile(
+                    title: Text(l.name),
+                    subtitle: Text(l.localeId),
+                    trailing:
+                        sel ? const Icon(Icons.check, color: Colors.green) : null,
+                    onTap: () => Navigator.pop(context, l.localeId),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 // ============================================================
@@ -1090,6 +1281,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
   String? _localeId;
   String _committed = '';
   String _partial = '';
+  String _lastFinal = '';
   String _engine = 'idle';
   String _lastErr = '';
   int _results = 0;
@@ -1173,6 +1365,37 @@ class _RecorderScreenState extends State<RecorderScreen> {
     }
   }
 
+  Future<void> _pickLanguage() async {
+    if (_locales.isEmpty) {
+      await _initSpeech();
+      if (_locales.isEmpty) {
+        _setError('No speech languages were found. Check that the Google app '
+            'is installed and updated, then try again.');
+        return;
+      }
+    }
+    if (!mounted) return;
+    final chosen = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (ctx) => LanguageSheet(locales: _locales, selected: _localeId),
+    );
+    if (chosen != null && mounted) {
+      setState(() => _localeId = chosen);
+      _savePrefs();
+    }
+  }
+
+  String get _languageName {
+    final id = _localeId;
+    if (id == null) return 'Not selected';
+    for (final l in _locales) {
+      if (l.localeId == id) return l.name;
+    }
+    return id;
+  }
+
   String _friendlyError(String m) {
     if (m.contains('network') || m.contains('server')) {
       return 'The speech engine could not reach the internet. Turn on '
@@ -1222,17 +1445,37 @@ class _RecorderScreenState extends State<RecorderScreen> {
     }
   }
 
+  bool _alreadyCommitted(String words) {
+    final c = _committed.trim().toLowerCase();
+    final w = words.trim().toLowerCase();
+    return w.isNotEmpty && c.endsWith(w);
+  }
+
   void _onSpeech(SpeechRecognitionResult r) {
     if (!mounted) return;
     if (_state == RecState.idle && !_saving) return;
-    setState(() {
-      _results++;
-      _partial = r.recognizedWords;
-      if (r.finalResult) {
-        _committed = _fullText;
-        _partial = '';
+    final words = r.recognizedWords.trim();
+
+    if (r.finalResult) {
+      // The phone sometimes delivers the same final sentence twice.
+      if (words.isEmpty || words == _lastFinal || _alreadyCommitted(words)) {
+        setState(() => _partial = '');
+        return;
       }
-    });
+      _lastFinal = words;
+      setState(() {
+        _results++;
+        _committed = [_committed, words].where((s) => s.isNotEmpty).join(' ');
+        _partial = '';
+      });
+    } else {
+      if (_alreadyCommitted(words)) return;
+      setState(() {
+        _results++;
+        _partial = words;
+      });
+    }
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scroll.hasClients) {
         _scroll.animateTo(
@@ -1312,6 +1555,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
     _peakAll = 0;
     _committed = '';
     _partial = '';
+    _lastFinal = '';
     _sw
       ..stop()
       ..reset();
@@ -1596,35 +1840,29 @@ class _RecorderScreenState extends State<RecorderScreen> {
   }
 
   Widget _idleTop() {
-    final hasLocale =
-        _localeId != null && _locales.any((l) => l.localeId == _localeId);
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(
           children: [
             _speechStatus(),
-            const SizedBox(height: 8),
-            if (_locales.isNotEmpty)
-              DropdownButtonFormField<String>(
-                value: hasLocale ? _localeId : null,
-                isExpanded: true,
-                decoration: const InputDecoration(
-                  labelText: 'Speaking language',
-                  helperText: 'For offline use, download this language in '
-                      'your phone voice settings',
-                ),
-                items: _locales
-                    .map((l) => DropdownMenuItem(
-                          value: l.localeId,
-                          child: Text(l.name, overflow: TextOverflow.ellipsis),
-                        ))
-                    .toList(),
-                onChanged: (v) {
-                  setState(() => _localeId = v);
-                  _savePrefs();
-                },
+            const SizedBox(height: 4),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.language),
+              title: const Text('Speaking language'),
+              subtitle: Text(_languageName),
+              trailing: const Icon(Icons.arrow_drop_down),
+              onTap: _pickLanguage,
+            ),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'Tap to search and choose any language your phone supports. '
+                'For offline use, download it in your phone voice settings.',
+                style: Theme.of(context).textTheme.labelSmall,
               ),
+            ),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
               title: const Text('Also save audio'),
